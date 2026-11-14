@@ -19,7 +19,7 @@ AMB-1 by Charles Vestal. GPL-3.0, as they are: see [LICENSE](../LICENSE) and [LI
   Input page sets their level and how much goes through dry.
 - **The screen.** The piece, its key and tempo, where it is in its arc, the chord sounding, a scope, the five layers'
   levels and the page's four knobs, all at once.
-- **The landscape** (1.1). MENU turns the screen into a painting of the piece as it plays: the Lead in the sky,
+- **The landscape** (1.1). K5 (or MENU) turns the screen into a painting of the piece as it plays: the Lead in the sky,
   Sequence 2 in the hills, the Sequence in the fields and the Drone in the bog. Pitch sets where a note lands,
   velocity how much paint, tempo the wind. K3 changes its colours (heather, atlantic, kells, evening) and K4 its
   ground (vellum, night, mist). Hosts with a stage show it there too, twice the size, beside the panel. It is the
@@ -52,7 +52,7 @@ AMB-1 by Charles Vestal. GPL-3.0, as they are: see [LICENSE](../LICENSE) and [LI
 | REC | hold the dub |
 | K1 | IN 1 and IN 2 into the effects |
 | K2, twice | the piece as written |
-| MENU | the landscape, or the panel |
+| K5, or MENU | the landscape, or the panel |
 | K3, K4 | the landscape's colours, its ground |
 | HOME | this list, on the screen |
 

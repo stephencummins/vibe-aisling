@@ -448,7 +448,7 @@ static uint32_t ai_say_until;                    /* in output frames */
 static float ai_sr;
 static uint32_t ai_fxp, ai_fxb, ai_mv;           /* the effects held: on the pads, on the black keys; the moves */
 static int ai_help;                              /* HOME's overview open */
-static int ai_land;                              /* MENU: the display is the landscape */
+static int ai_land;                              /* K5 or MENU: the display is the landscape */
 static uint8_t ai_lpal, ai_lgnd;                 /* its colours (K3: 4 of them) and its ground (K4: 3) */
 #define AI_SW 960                                /* the stage: the landscape's 480 x 270, each pixel four */
 #define AI_SH 540
@@ -994,7 +994,8 @@ static void ai_button(int b, int down)
             ai_say("K2 again:", "the piece as written");
         }
         break;
-    case VB_MENU:                                /* the display: the landscape, the panel */
+    case VB_K5:                                  /* the display: the landscape, the panel. MENU too, where a */
+    case VB_MENU:                                /* device has the key (the Playground's has not) */
         ai_help = 0;
         ai_land = !ai_land;
         ai_sdirty = 1;
@@ -1094,6 +1095,7 @@ void vibe_on_init(float sample_rate)
     vibe_label(VB_K2, "RESET");
     vibe_label(VB_K3, "COLOURS");
     vibe_label(VB_K4, "GROUND");
+    vibe_label(VB_K5, "LAND");
     vibe_label(VB_MENU, "LAND");
     ai_nw = ai_nr = 0;
     ai_land = 0;
@@ -1201,7 +1203,7 @@ static const char *const AI_HELP[] = {
     "MIDI IN", "Lead notes, clock",
     "K1", "IN 1/2 into the FX",
     "K2 twice", "piece as written",
-    "MENU", "the landscape",
+    "K5, MENU", "the landscape",
     "K3, K4", "its colours, ground",
 };
 
@@ -1215,7 +1217,7 @@ static void ai_trim(char *d, const char *t, int n)   /* (Link's names: up to n c
 /* --------------------------------------------------------------------------------------------- the landscape --- */
 /* The piece painted (land.c, from the AISLING visualiser box, itself from the web visualiser's Land scene): the Lead
  * in the sky, Sequence 2 in the hills, the Sequence in the fields, the Drone in the bog; pitch across, velocity the
- * paint, tempo the wind. On the display (MENU) and, twice the size, on the stage. It runs only while one of them is
+ * paint, tempo the wind. On the display (K5 or MENU) and, twice the size, on the stage. It runs only while one of them is
  * drawn, on the output's clock; the sound never waits on it or hears of it. */
 static uint16_t ai_lpx[LAND_W * LAND_H];         /* the landscape now, for both */
 static uint32_t ai_lat;                          /* painted up to this output frame */
@@ -1301,7 +1303,7 @@ static void ai_land_draw(uint16_t *fb)           /* the display: the landscape; 
     if (ai_frames < ai_say_until)
         vg_text(ai_said, 240, 300, VG_SMALL, AI_TEXT, VG_CENTER);
     else
-        vg_text("MENU: the panel", 240, 300, VG_SMALL, AI_DIM, VG_CENTER);
+        vg_text("K5: the panel", 240, 300, VG_SMALL, AI_DIM, VG_CENTER);
     vg_text(en_frozen ? "HOLD" : en_playing ? "PLAYING" : "RESTING", 470, 300, VG_SMALL,
         en_frozen ? 0xFF3B30 : en_playing ? AI_GREEN : AI_DIM, VG_RIGHT);
 }
@@ -1343,6 +1345,7 @@ void vibe_on_draw(uint16_t *fb)
         vg_controls("AISLING", AI_HELP, (int)(sizeof AI_HELP / sizeof AI_HELP[0] / 2));
         return;
     }
+    vibe_led_button(VB_K5, AI_GREEN, ai_land ? 1.0f : 0.15f);
     vibe_led_button(VB_MENU, AI_GREEN, ai_land ? 1.0f : 0.15f);
     if (ai_land) {
         if ((ai_dirty || ai_sdirty) && ai_frames - ai_dirty_at > (uint32_t)(2.0f * ai_sr))
