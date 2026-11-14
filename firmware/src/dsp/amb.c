@@ -672,6 +672,9 @@ static int irand(int n) { return n > 0 ? (int)((rnd() >> 8) % (uint32_t)n) : 0; 
 
 static void midi(uint32_t st, uint32_t d1, uint32_t d2)
 {
+#ifdef EN_NOTES
+    en_note_tap(st, d1, d2);
+#endif
     if (par[P_MIDI])
         en_midi_out(st, d1, d2);
 }

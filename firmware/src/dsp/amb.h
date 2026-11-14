@@ -205,6 +205,11 @@ extern float en_in_dry;                          /* how much of it goes straight
 
 /* MIDI out, from the render: the app sends it (USB); status, data 1, data 2 */
 void en_midi_out(uint32_t st, uint32_t d1, uint32_t d2);
+#ifdef EN_NOTES
+/* (a host that paints the notes: the VIBE's landscape) every message the engine would send, whether or not MIDI out
+ * is on; from the render. Not in the FM-1's build */
+void en_note_tap(uint32_t st, uint32_t d1, uint32_t d2);
+#endif
 
 /* the voices: each layer's sounds (ALGORITHM on the layer's page) */
 #define EN_NCV 6                         /* (BERLIN) the Drone's voices: Organ, Strings, Horn, Saws, Glass, Choir */

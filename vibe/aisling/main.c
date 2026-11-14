@@ -14,6 +14,7 @@
  * drawing reads the engine's volatile state, as the FM-1's screen does. */
 #include "vibe.h"
 #include "vibe_gfx.h"
+#include "land.h"
 
 VIBE_PARALLEL_AUDIO
 
@@ -22,6 +23,7 @@ VIBE_PARALLEL_AUDIO
  * longer be the FM-1's). (wasm has no fused multiply-add, so nothing contracts) */
 #define EN_HOST 1
 #define EN_IN 1                                  /* (the engine's one addition here: amb.h's en_in_l, en_in_r) */
+#define EN_NOTES 1                               /* (and its notes to the landscape, MIDI out on or off: en_note_tap) */
 #pragma clang fp reassociate(off)
 #pragma clang fp reciprocal(off)
 #pragma clang fp contract(off)
@@ -126,7 +128,31 @@ static void ai_drain(void)                       /* the commands into the engine
 }
 
 /* the engine's MIDI out (it sends only while MIDI out is on): from the render, so from the audio flow alone */
-void en_midi_out(uint32_t st, uint32_t d1, uint32_t d2) { vibe_midi_send((uint8_t)st, (uint8_t)d1, (uint8_t)d2); }
+/* the landscape's notes: the audio writes ai_nq, then ai_nw; the drawing reads to ai_nw, then ai_nr. Full (nothing
+ * is painting): dropped */
+#define AI_NN 256u
+static uint32_t ai_nq[AI_NN];
+static volatile uint32_t ai_nw, ai_nr;
+static void ai_note(uint32_t st, uint32_t d1, uint32_t d2)
+{
+    const uint32_t w = ai_nw;
+    if (w - ai_nr >= AI_NN)
+        return;
+    ai_nq[w % AI_NN] = st | d1 << 8 | d2 << 16;
+    VIBE_RELEASE();
+    ai_nw = w + 1u;
+}
+void en_note_tap(uint32_t st, uint32_t d1, uint32_t d2)
+{
+    if (st < 0xF0u || st == 0xFCu)               /* (notes, and the stop: not the clock) */
+        ai_note(st, d1, d2);
+}
+void en_midi_out(uint32_t st, uint32_t d1, uint32_t d2)
+{
+    if ((st & 0xF0u) == 0xB0u)                   /* (all notes off: the engine sends it past its own gate) */
+        ai_note(st, d1, d2);
+    vibe_midi_send((uint8_t)st, (uint8_t)d1, (uint8_t)d2);
+}
 
 /* ------------------------------------------------------------------------------------------- the resampler --- */
 #define AI_RQ 256u                               /* the engine's block: the FM-1's (main_fm1.c: REND_FRAMES(256)) */
@@ -422,6 +448,11 @@ static uint32_t ai_say_until;                    /* in output frames */
 static float ai_sr;
 static uint32_t ai_fxp, ai_fxb, ai_mv;           /* the effects held: on the pads, on the black keys; the moves */
 static int ai_help;                              /* HOME's overview open */
+static int ai_land;                              /* MENU: the display is the landscape */
+static uint8_t ai_lpal, ai_lgnd;                 /* its colours (K3: 4 of them) and its ground (K4: 3) */
+#define AI_SW 960                                /* the stage: the landscape's 480 x 270, each pixel four */
+#define AI_SH 540
+static uint16_t ai_stage[AI_SW * AI_SH];
 static float ai_acc[VE_COUNT];                   /* the encoders' fractions of a detent */
 static const char *ai_piece_ch[EN_NPIECES];
 
@@ -485,6 +516,11 @@ typedef struct {
     uint8_t piece, grp;
     int16_t tune, midi;
 } ai_sfile;
+typedef struct {                                 /* (1.1: the landscape. Its own file, so 1.0's state still reads) */
+    uint32_t magic;
+    uint16_t format;
+    uint8_t view, pal, gnd, spare;
+} ai_lfile;
 static uint8_t ai_edited[EN_NPIECES];            /* the piece has a file */
 static int ai_dirty, ai_sdirty;                  /* the piece's edits, the state: not written yet */
 static uint32_t ai_dirty_at, ai_reset_until;     /* in output frames */
@@ -553,6 +589,16 @@ static void ai_store(void)                       /* (the events and the draw: ne
         f.tune = ai_par[P_TUNE];
         f.midi = ai_par[P_MIDI];
         vibe_store_write("state", &f, (int)sizeof f);
+        {
+            ai_lfile l;
+            memset(&l, 0, sizeof l);
+            l.magic = AI_MAGIC;
+            l.format = AI_FORMAT;
+            l.view = (uint8_t)ai_land;
+            l.pal = ai_lpal;
+            l.gnd = ai_lgnd;
+            vibe_store_write("land", &l, (int)sizeof l);
+        }
         ai_sdirty = 0;
     }
 }
@@ -948,6 +994,24 @@ static void ai_button(int b, int down)
             ai_say("K2 again:", "the piece as written");
         }
         break;
+    case VB_MENU:                                /* the display: the landscape, the panel */
+        ai_help = 0;
+        ai_land = !ai_land;
+        ai_sdirty = 1;
+        ai_dirty_at = ai_frames;
+        break;
+    case VB_K3:
+        ai_lpal = (uint8_t)((ai_lpal + 1) % 4);
+        ai_say("Colours:", land_next_palette());
+        ai_sdirty = 1;
+        ai_dirty_at = ai_frames;
+        break;
+    case VB_K4:
+        ai_lgnd = (uint8_t)((ai_lgnd + 1) % 3);
+        ai_say("Ground:", land_next_ground());
+        ai_sdirty = 1;
+        ai_dirty_at = ai_frames;
+        break;
     case VB_HOME: ai_help = !ai_help; break;
     case VB_RETURN: ai_help = 0; break;
     }
@@ -976,7 +1040,7 @@ static void ai_param(int id, float v)
 void vibe_on_event(const vibe_event *e)
 {
     int id;
-    if (!ai_help && vf_event(e, &id) != VF_NO)   /* (FOCUS: DATA walks the knobs and F1-F6; theirs come back as events) */
+    if (!ai_help && !ai_land && vf_event(e, &id) != VF_NO)   /* (FOCUS: DATA walks the knobs and F1-F6; theirs come back as events) */
         return;
     switch (e->type) {
     case VIBE_EV_KEY: ai_key(e->id, e->down); break;
@@ -1028,6 +1092,25 @@ void vibe_on_init(float sample_rate)
     vibe_input_link(1);                          /* IN 1 and IN 2: left and right */
     vibe_label(VB_K1, "INPUT");
     vibe_label(VB_K2, "RESET");
+    vibe_label(VB_K3, "COLOURS");
+    vibe_label(VB_K4, "GROUND");
+    vibe_label(VB_MENU, "LAND");
+    ai_nw = ai_nr = 0;
+    ai_land = 0;
+    ai_lpal = ai_lgnd = 0;
+    land_init(0x9e3779b9u);
+    {
+        ai_lfile l;
+        if (vibe_store_read("land", &l, (int)sizeof l) == (int)sizeof l && l.magic == AI_MAGIC && l.format == AI_FORMAT
+            && l.pal < 4 && l.gnd < 3) {
+            ai_land = l.view != 0;
+            for (ai_lpal = 0; ai_lpal < l.pal; ai_lpal++)
+                land_next_palette();
+            for (ai_lgnd = 0; ai_lgnd < l.gnd; ai_lgnd++)
+                land_next_ground();
+        }
+    }
+    vibe_stage(ai_stage, AI_SW, AI_SH, 0x101613, 0);   /* (above the device: the panel stays in view) */
     for (i = 0; i < 6; i++)
         vibe_label(VB_F1 + i, AI_GRP[i].cap);
     ai_sr = sample_rate;
@@ -1118,6 +1201,8 @@ static const char *const AI_HELP[] = {
     "MIDI IN", "Lead notes, clock",
     "K1", "IN 1/2 into the FX",
     "K2 twice", "piece as written",
+    "MENU", "the landscape",
+    "K3, K4", "its colours, ground",
 };
 
 static void ai_trim(char *d, const char *t, int n)   /* (Link's names: up to n characters) */
@@ -1125,6 +1210,100 @@ static void ai_trim(char *d, const char *t, int n)   /* (Link's names: up to n c
     while (n-- && *t)
         *d++ = *t++;
     *d = 0;
+}
+
+/* --------------------------------------------------------------------------------------------- the landscape --- */
+/* The piece painted (land.c, from the AISLING visualiser box, itself from the web visualiser's Land scene): the Lead
+ * in the sky, Sequence 2 in the hills, the Sequence in the fields, the Drone in the bog; pitch across, velocity the
+ * paint, tempo the wind. On the display (MENU) and, twice the size, on the stage. It runs only while one of them is
+ * drawn, on the output's clock; the sound never waits on it or hears of it. */
+static uint16_t ai_lpx[LAND_W * LAND_H];         /* the landscape now, for both */
+static uint32_t ai_lat;                          /* painted up to this output frame */
+
+static void ai_land_run(void)
+{
+    const uint32_t now = ai_frames, w = ai_nw;
+    uint32_t r = ai_nr;
+    float dt = (float)(now - ai_lat) * 60.0f / ai_sr;
+    const int stale = dt > 30.0f;                /* (not drawn for half a second: what waited is old) */
+    if (dt < 0.05f && now != 0u)                 /* (the display and the stage in one frame: once) */
+        return;
+    VIBE_ACQUIRE();
+    for (; r != w; r++) {
+        const uint32_t m = ai_nq[r % AI_NN], st = m & 255u, d1 = m >> 8 & 127u, d2 = m >> 16 & 127u;
+        if (stale)
+            continue;
+        if ((st & 0xF0u) == 0x90u)
+            land_note_on((uint8_t)(st & 15u), (uint8_t)d1, (uint8_t)d2);
+        else if ((st & 0xF0u) == 0x80u)
+            land_note_off((uint8_t)(st & 15u), (uint8_t)d1);
+        else if ((st & 0xF0u) == 0xB0u && (st & 15u) < 4u)
+            land_all_off((int)(st & 15u));
+        else if (st == 0xFCu)
+            land_all_off(-1);
+    }
+    ai_nr = r;
+    if (stale) {
+        land_all_off(-1);
+        dt = 1.0f;
+    }
+    ai_lat = now;
+    land_set_bpm(en_playing ? ai_hhas ? ai_hbpm : (float)ai_par[P_TEMPO] : 0.0f);
+    land_step(dt > 15.0f ? 15.0f : dt < 0.05f ? 0.05f : dt);
+    land_prepare(true);
+    land_render(0, 0, LAND_W, LAND_H, ai_lpx);
+}
+
+void vibe_on_stage(uint16_t *fb, int w, int h)   /* the stage: the landscape, each pixel four; the piece and its chord */
+{
+    char s[48], *q;
+    int x, y;
+    if (w != AI_SW || h != AI_SH)
+        return;
+    ai_land_run();
+    for (y = 0; y < AI_SH; y++) {
+        const uint16_t *const p = ai_lpx + (y >> 1) * LAND_W;
+        uint16_t *const o = fb + y * AI_SW;
+        for (x = 0; x < LAND_W; x++)
+            o[2 * x] = o[2 * x + 1] = p[x];
+    }
+    q = ai_cat(s, en_piece_name(ai_piece));
+    q = ai_cat(q, "   ");
+    ai_chord(q);
+    vg_rect(0, AI_SH - 52, AI_SW, 52, 0x0E1512); /* (a strip, as the display's: the paint may be any colour) */
+    vg_rect(0, AI_SH - 52, AI_SW, 2, AI_GREEN);
+    vg_text(s, 24, AI_SH - 40, VG_MED | VG_X2, AI_TEXT, VG_LEFT);
+    vg_text("AISLING", AI_SW - 24, AI_SH - 40, VG_BOLD | VG_X2, AI_GREEN, VG_RIGHT);
+}
+
+static void ai_land_draw(uint16_t *fb)           /* the display: the landscape; under it the piece, its chord, the arc */
+{
+    char s[48], *q;
+    int i;
+    ai_land_run();
+    memcpy(fb, ai_lpx, sizeof ai_lpx);
+    vg_rect(0, LAND_H, 480, 320 - LAND_H, 0x0E1512);
+    vg_rect(0, LAND_H, 480, 1, AI_GREEN);
+    q = ai_cat(s, en_piece_name(ai_piece));
+    if (ai_dirty || ai_edited[ai_piece])
+        ai_cat(q, " *");
+    vg_text(s, 10, 278, VG_BOLD, AI_GREEN, VG_LEFT);
+    vg_text(ai_chord(s), 240, 276, VG_BIG, AI_TEXT, VG_CENTER);
+    q = ai_cat(s, EN_NOTE_NAME[ai_par[P_ROOT] % 12]);
+    q = ai_cat(q, " ");
+    q = ai_cat(q, EN_MODE_NAME[ai_par[P_MODE] % EN_NMODES]);
+    q = ai_cat(q, "  ");
+    vg_itoa(ai_hhas ? (int)(ai_hbpm + 0.5f) : ai_par[P_TEMPO], q);
+    vg_text(s, 470, 278, VG_BOLD, AI_TEXT, VG_RIGHT);
+    vg_text(EN_SEC_NAME[en_section % EN_NSEC], 10, 300, VG_SMALL, AI_DIM, VG_LEFT);
+    for (i = 0; i < 8; i++)
+        vg_rect(84 + i * 12, 304, 9, 7, i == (int)(en_phrase_bar % 8u) ? AI_GREEN : i < (int)(en_phrase_bar % 8u) ? 0x2F5A44 : 0x1C2621);
+    if (ai_frames < ai_say_until)
+        vg_text(ai_said, 240, 300, VG_SMALL, AI_TEXT, VG_CENTER);
+    else
+        vg_text("MENU: the panel", 240, 300, VG_SMALL, AI_DIM, VG_CENTER);
+    vg_text(en_frozen ? "HOLD" : en_playing ? "PLAYING" : "RESTING", 470, 300, VG_SMALL,
+        en_frozen ? 0xFF3B30 : en_playing ? AI_GREEN : AI_DIM, VG_RIGHT);
 }
 
 static int ai_drawn;
@@ -1162,6 +1341,13 @@ void vibe_on_draw(uint16_t *fb)
     }
     if (ai_help) {
         vg_controls("AISLING", AI_HELP, (int)(sizeof AI_HELP / sizeof AI_HELP[0] / 2));
+        return;
+    }
+    vibe_led_button(VB_MENU, AI_GREEN, ai_land ? 1.0f : 0.15f);
+    if (ai_land) {
+        if ((ai_dirty || ai_sdirty) && ai_frames - ai_dirty_at > (uint32_t)(2.0f * ai_sr))
+            ai_store();
+        ai_land_draw(fb);
         return;
     }
     vg_clear(AI_BG);
