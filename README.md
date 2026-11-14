@@ -1,5 +1,8 @@
 # AISLING for the M-VAVE FM-1
 
+> **AISLING for VIBE FM**: the same engine as a native VIBE FM firmware, with audio in, the pads, the screen, saving
+> and the DAW, is in [vibe/](vibe/README.md).
+
 <img src="docs/card.png" width="240" height="240" alt="AISLING: a gold 8-bit harp on green">
 
 **[Install](https://aisling.stephen8n.com/install/)** (Chrome or Edge on a computer, the FM-1 on USB;
