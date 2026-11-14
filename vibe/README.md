@@ -7,6 +7,8 @@ chanter or a voice leading, and the weather of the west coast behind them. Eight
 you can play along. It began as a firmware for the M-VAVE FM-1 (the rest of this repository); this folder is the same
 engine as a native VIBE FM firmware, with what the VIBE has and the FM-1 has not.
 
+<img src="landscape.png" width="480" height="270" alt="The landscape: the piece Skellig painted as green hills, a heather bloom and a pale sky">
+
 By CU_STE. A fork of [NACHTFAHRT](https://github.com/FartyPants/fm1-nachtfahrt) by FartyPants, itself after DUB-1 and
 AMB-1 by Charles Vestal. GPL-3.0, as they are: see [LICENSE](../LICENSE) and [LICENSING.md](../LICENSING.md).
 
@@ -17,6 +19,12 @@ AMB-1 by Charles Vestal. GPL-3.0, as they are: see [LICENSE](../LICENSE) and [LI
   Input page sets their level and how much goes through dry.
 - **The screen.** The piece, its key and tempo, where it is in its arc, the chord sounding, a scope, the five layers'
   levels and the page's four knobs, all at once.
+- **The landscape** (1.1). MENU turns the screen into a painting of the piece as it plays: the Lead in the sky,
+  Sequence 2 in the hills, the Sequence in the fields and the Drone in the bog. Pitch sets where a note lands,
+  velocity how much paint, tempo the wind. K3 changes its colours (heather, atlantic, kells, evening) and K4 its
+  ground (vellum, night, mist). Hosts with a stage show it there too, twice the size, beside the panel. It is the
+  painting from the [AISLING visualiser](https://github.com/stephencummins/aisling-viz-box), running inside the
+  firmware.
 - **Sixteen pads.** One held effect each, in four rows: echo, filter, space and moves.
 - **Six page keys.** F1 to F6 choose a layer (Piece, Drone, Sequence, Lead, Sequence 2, Space); the same key again
   turns to the layer's next page. 26 pages of four knobs, with no menu.
@@ -44,6 +52,8 @@ AMB-1 by Charles Vestal. GPL-3.0, as they are: see [LICENSE](../LICENSE) and [LI
 | REC | hold the dub |
 | K1 | IN 1 and IN 2 into the effects |
 | K2, twice | the piece as written |
+| MENU | the landscape, or the panel |
+| K3, K4 | the landscape's colours, its ground |
 | HOME | this list, on the screen |
 
 The eight pieces: Skellig, Burren, Aran, Carolan, Blasket, Samhain, Connemara, Tir na nOg.
@@ -61,4 +71,5 @@ node tools/vibe-check.mjs build/aisling.wasm
 VIBE FM plugin's window.
 
 The engine is the FM-1's own source (`firmware/src/dsp`), compiled as it is. At 44.1 kHz its samples go out
-unchanged; at any other rate a windowed-sinc resampler takes them to the host's.
+unchanged; at any other rate a windowed-sinc resampler takes them to the host's. The landscape only watches the
+notes: the sound is the same, to the bit, whether it is drawn or not.
