@@ -53,6 +53,7 @@ static void ai_post(int op, int a, int32_t v)   /* (the control flow only) */
 /* ------------------------------------------------------------------------------------- the audio's own side --- */
 static uint32_t ai_frames;                       /* output frames so far (the seed's entropy, as the FM-1's clock) */
 static int16_t ai_apar[P_NPARAMS];               /* a piece's recipe, as the audio loads it */
+static int ai_atempo, ai_htempo;                 /* the piece's own Tempo; the host's while it leads (0: it doesn't) */
 static volatile uint32_t ai_gain = 2048u;        /* Q12, the FM-1's MASTER: Volume 0.5 is 2048, en_render's host's */
 
 static void ai_piece_load(int i)                 /* ui.c's set_piece: the recipe, its scale, its loops grown afresh;
@@ -85,8 +86,20 @@ static void ai_do(const ai_cmd *c)
             en_play(0);
         break;
     case AI_FREEZE: en_freeze((int)c->v); break;
-    case AI_PIECE: ai_piece_load(c->a); break;
-    case AI_SET: en_set(c->a, (int)c->v); break;
+    case AI_PIECE:
+        ai_piece_load(c->a);
+        ai_atempo = ai_apar[P_TEMPO];
+        if (ai_htempo)                           /* (the host leads: its tempo still) */
+            en_set(P_TEMPO, ai_htempo);
+        break;
+    case AI_SET:
+        if (c->a == P_TEMPO) {
+            ai_atempo = (int)c->v;
+            if (ai_htempo)
+                break;
+        }
+        en_set(c->a, (int)c->v);
+        break;
     case AI_MACRO: en_macro(c->a, (int)c->v); break;
     case AI_CLOCK: en_clock(c->a); break;
     case AI_PANIC: en_panic(); break;
@@ -181,6 +194,70 @@ static void ai_table(float (*ai_h)[AI_TAPS], float (*ai_dh)[AI_TAPS], double cut
             ai_dh[p][k] = ai_h[p + 1][k] - ai_h[p][k];
 }
 
+/* ---------------------------------------------------------------------------------------- the host's clock --- */
+/* A DAW that plays (the plugin), a MIDI clock (the VIBE, the browser): vibe_transport() gives its tempo and where it
+ * is, in quarters. The engine follows a clock as on the FM-1 (en_clock: 24 a quarter, six a step, START from the top):
+ * the pulses are counted off the host's position, so the grid stays on the host's beat, and a loop only goes on */
+static volatile uint8_t ai_hhas;                 /* the host leads (the events: MIDI's own clock bytes left alone) */
+static volatile float ai_hbpm;                   /* its tempo, for the display */
+static int ai_hplay;
+static int ai_hsr = 48000;                       /* the host's rate */
+static int32_t ai_hlast;                         /* the last pulse given */
+static double ai_hpos, ai_htpf;                  /* the block's first frame in pulses; pulses a frame */
+
+static int32_t ai_floor(double x)
+{
+    const int32_t i = (int32_t)x;
+    return x < (double)i ? i - 1 : i;
+}
+
+static void ai_host_block(void)                  /* a host's block begins */
+{
+    const vibe_transport_info *t = vibe_transport();
+    const int lead = t && t->has && t->bpm > 0.0f;
+    ai_hhas = (uint8_t)lead;
+    if (lead) {
+        const en_param_t *in = en_param_info(P_TEMPO);
+        int b = (int)(t->bpm + 0.5f);
+        b = b < in->lo ? in->lo : b > in->hi ? in->hi : b;
+        if (b != ai_htempo) {                    /* (the echo's times, the swing: by its tempo too) */
+            ai_htempo = b;
+            en_set(P_TEMPO, b);
+        }
+        ai_hbpm = t->bpm;
+    } else if (ai_htempo) {                      /* it gave the tempo back: the piece's own again */
+        ai_htempo = 0;
+        en_set(P_TEMPO, ai_atempo);
+    }
+    if (lead && t->playing) {
+        const double pos = t->beat * 24.0;
+        const int32_t at = ai_floor(pos);
+        if (!ai_hplay) {
+            ai_hplay = 1;
+            en_clock(EN_CLK_START);
+            ai_hlast = at - 1;                   /* (the first pulse with the start) */
+        } else if (at < ai_hlast - 1 || at > ai_hlast + 8)
+            ai_hlast = at;                       /* (it jumped: a loop, a click in the song) */
+        ai_hpos = pos;
+        ai_htpf = (double)t->bpm * 24.0 / (60.0 * (double)ai_hsr);
+    } else if (ai_hplay) {
+        ai_hplay = 0;
+        en_clock(EN_CLK_STOP);
+    }
+}
+
+static void ai_host_to(int n)                    /* before an engine block: the pulses due by the host block's frame n */
+{
+    if (ai_hplay) {
+        const int32_t at = ai_floor(ai_hpos + (double)n * ai_htpf);
+        int k = 0;
+        while (ai_hlast < at && k++ < 8) {
+            en_clock(EN_CLK_TICK);
+            ai_hlast++;
+        }
+    }
+}
+
 static void ai_render(void)                      /* one engine block into the ring */
 {
     uint32_t k;
@@ -203,6 +280,12 @@ static void ai_render(void)                      /* one engine block into the ri
         ai_fr[i] = (float)ai_blk[2u * k + 1u] * (1.0f / 8388608.0f);
     }
     ai_fw += AI_RQ;
+}
+
+static void ai_render_at(int n)                  /* (at the host block's frame n) */
+{
+    ai_host_to(n);
+    ai_render();
 }
 
 static float ai_clip(float x) { return x > 1.0f ? 1.0f : x < -1.0f ? -1.0f : x; }
@@ -267,6 +350,7 @@ void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
     float pl = ai_in_pk[0], pr = ai_in_pk[1];
     int n;
     ai_in_seen = in || in2;
+    ai_host_block();
     if (!in)                                     /* one jack only: it, in the middle */
         in = in2;
     if (!in2)
@@ -290,7 +374,7 @@ void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
             else
                 ai_in_frame(0.0f, 0.0f);
             if (ai_ip == ai_fw)
-                ai_render();
+                ai_render_at(n);
             i = ai_ip++ & (AI_RN - 1u);
             out_l[n] = ai_clip(ai_fl[i]);
             out_r[n] = ai_clip(ai_fr[i]);
@@ -310,7 +394,7 @@ void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
             else
                 ai_in_frame(0.0f, 0.0f);
             while ((int32_t)(ai_fw - ai_ip) < AI_HALF + 1)
-                ai_render();
+                ai_render_at(n);
             for (k = 0; k < AI_TAPS; k++) {
                 const float c = h[k] + t * dh[k];
                 const uint32_t i = (base + (uint32_t)k) & (AI_RN - 1u);
@@ -342,7 +426,7 @@ static float ai_acc[VE_COUNT];                   /* the encoders' fractions of a
 static const char *ai_piece_ch[EN_NPIECES];
 
 enum { AP_VOLUME, AP_PIECE, AP_INPUT, AP_INDRY, AP_N };
-static const vibe_param AI_PARAMS[AP_N] = {
+static const vibe_param AI_PARAMS0[AP_N] = {
     {"volume", "Volume", 0.0f, 1.0f, 0.5f, "", 0, 0},
     {"piece", "Piece", 0.0f, (float)(EN_NPIECES - 1), 0.0f, "", EN_NPIECES, ai_piece_ch},
     {"input", "Input", 0.0f, 1.0f, 0.8f, "", 0, 0},
@@ -404,6 +488,8 @@ typedef struct {
 static uint8_t ai_edited[EN_NPIECES];            /* the piece has a file */
 static int ai_dirty, ai_sdirty;                  /* the piece's edits, the state: not written yet */
 static uint32_t ai_dirty_at, ai_reset_until;     /* in output frames */
+
+static void ai_tell_all(void);
 
 static int ai_global(int p) { return p == P_TUNE || p == P_MIDI; }
 
@@ -505,6 +591,7 @@ static void ai_piece_go(int i, int saved)
     ai_edited[ai_piece] = n != 0;
     ai_par[P_TUNE] = tune;                       /* (not a piece's: as they were) */
     ai_par[P_MIDI] = midi;
+    ai_tell_all();
 }
 
 static void ai_set_piece(int i)
@@ -548,9 +635,10 @@ static void ai_pad(int p, int down)
 static void ai_midi(const uint8_t *m)            /* (ui.c's midi_in) notes on any channel: the Lead; clock: the grid */
 {
     const uint32_t st = m[0], hi = st & 0xF0u;
-    if (st == 0xF8u || st == 0xFAu || st == 0xFBu || st == 0xFCu)
-        ai_post(AI_CLOCK, st == 0xF8u ? EN_CLK_TICK : st == 0xFAu ? EN_CLK_START : st == 0xFBu ? EN_CLK_CONTINUE : EN_CLK_STOP, 0);
-    else if (hi == 0x90u || hi == 0x80u)
+    if (st == 0xF8u || st == 0xFAu || st == 0xFBu || st == 0xFCu) {
+        if (!ai_hhas)                            /* (the host counts the same clock into its position: once) */
+            ai_post(AI_CLOCK, st == 0xF8u ? EN_CLK_TICK : st == 0xFAu ? EN_CLK_START : st == 0xFBu ? EN_CLK_CONTINUE : EN_CLK_STOP, 0);
+    } else if (hi == 0x90u || hi == 0x80u)
         ai_post(AI_LMIDI, m[1] & 0x7F, hi == 0x90u && m[2]);
     else if (hi == 0xB0u && (m[1] == 120u || m[1] == 123u))
         ai_post(AI_LMIDI, -1, 0);
@@ -636,17 +724,26 @@ static int ai_kget(int k)
     return 0;
 }
 
+static void ai_krange(int k, int *lo, int *hi)
+{
+    *lo = 0, *hi = 100;
+    if (k < P_NPARAMS)
+        *lo = en_param_info(k)->lo, *hi = en_param_info(k)->hi;
+    else if (k <= AK_ENERGY)
+        *lo = -50, *hi = 50;
+    else if (k == AK_MODE)
+        *hi = EN_NMODES - 1;
+}
+
+static void ai_tell(int k);
+
 static void ai_kset(int k, int v)
 {
-    int lo = 0, hi = 100;
+    const int k0 = k;
+    int lo, hi;
     if (k >= AK_NONE)
         return;
-    if (k < P_NPARAMS)
-        lo = en_param_info(k)->lo, hi = en_param_info(k)->hi;
-    else if (k <= AK_ENERGY)
-        lo = -50, hi = 50;
-    else if (k == AK_MODE)
-        hi = EN_NMODES - 1;
+    ai_krange(k, &lo, &hi);
     v = v < lo ? lo : v > hi ? hi : v;
     if (v == ai_kget(k))
         return;
@@ -674,6 +771,7 @@ static void ai_kset(int k, int v)
         vibe_param_set(id, (float)v * 0.01f);
         ai_param(id, (float)v * 0.01f);
     }
+    ai_tell(k0);
 }
 
 static void ai_ktext(int k, char *b)             /* (ui.c's knob_text) */
@@ -697,6 +795,74 @@ static void ai_ktext(int k, char *b)             /* (ui.c's knob_text) */
         ai_cat(b, EN_MODE_NAME[ai_par[P_MODE] % EN_NMODES]);
     else if (k < AK_NONE)
         vg_itoa(v, b);
+}
+
+/* the DAW's parameters: the four of the list above, then these knobs (their ids for ever: a song's automation hangs
+ * on them). A knob turned tells the host; the host's value turns the knob */
+static const struct {
+    const char *id, *name;
+    uint16_t k;
+} AI_AUTO[] = {
+    {"filter", "Filter", AK_FILTER}, {"wet", "Wet", AK_WET}, {"energy", "Energy", AK_ENERGY},
+    {"chorus", "Chorus", AK_CHORUS}, {"evolve", "Evolve", P_EVOLVE}, {"motion", "Motion", P_MOTION},
+    {"drone", "Drone level", P_CHORD}, {"seq", "Sequence level", P_SEQ}, {"lead", "Lead level", P_LEAD},
+    {"seq2", "Sequence 2 level", P_SEQ2}, {"atmos", "Atmosphere level", P_CRACKLE}, {"echo", "Echo", P_ECHO},
+    {"feedback", "Echo feedback", P_FEEDBACK}, {"reverb", "Reverb", P_REVERB},
+    {"density", "Sequence density", P_DENSITY}, {"phrases", "Lead phrases", P_LDENS}, {"tempo", "Tempo", P_TEMPO},
+    {"root", "Root", P_ROOT}, {"mode", "Mode", AK_MODE}, {"transpose", "Transpose", P_TRANS},
+};
+#define AI_NAUTO ((int)(sizeof AI_AUTO / sizeof AI_AUTO[0]))
+static vibe_param AI_PARAMS[AP_N + AI_NAUTO];
+static const char *ai_mode_ch[EN_NMODES];
+static int ai_from_host;
+
+static void ai_tell(int k)
+{
+    int i;
+    if (ai_from_host)
+        return;
+    for (i = 0; i < AI_NAUTO; i++)
+        if (AI_AUTO[i].k == k)
+            vibe_param_set(AP_N + i, (float)ai_kget(k));
+}
+
+static void ai_tell_all(void)                    /* (a piece chosen: every knob is another) */
+{
+    int i;
+    for (i = 0; i < AI_NAUTO; i++)
+        vibe_param_set(AP_N + i, (float)ai_kget(AI_AUTO[i].k));
+}
+
+static void ai_params_init(void)                 /* (their defaults: the first piece as written) */
+{
+    static int16_t rec[P_NPARAMS];
+    uint16_t pool;
+    int i, m;
+    en_piece(0, rec, &pool);
+    memcpy(AI_PARAMS, AI_PARAMS0, sizeof AI_PARAMS0);
+    for (i = 0; i < EN_NMODES; i++)
+        ai_mode_ch[i] = EN_MODE_NAME[AI_MODE_ORDER[i]];
+    for (i = 0; i < AI_NAUTO; i++) {
+        vibe_param *p = &AI_PARAMS[AP_N + i];
+        const int k = AI_AUTO[i].k;
+        int lo, hi, d = 0;
+        ai_krange(k, &lo, &hi);
+        if (k < P_NPARAMS)
+            d = rec[k];
+        else if (k == AK_MODE)
+            for (m = 0; m < EN_NMODES; m++)
+                if (AI_MODE_ORDER[m] == rec[P_MODE])
+                    d = m;
+        p->id = AI_AUTO[i].id;
+        p->name = AI_AUTO[i].name;
+        p->min = (float)lo;
+        p->max = (float)hi;
+        p->def = (float)(d < lo ? lo : d > hi ? hi : d);
+        p->unit = "";
+        p->steps = k == AK_MODE ? EN_NMODES : 0;
+        p->choices = k == AK_MODE ? ai_mode_ch : 0;
+    }
+    vibe_params(AI_PARAMS, AP_N + AI_NAUTO);
 }
 
 static void ai_say(const char *a, const char *b)
@@ -800,6 +966,11 @@ static void ai_param(int id, float v)
         ai_in_lvl = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
     else if (id == AP_INDRY)
         ai_in_dry = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+    else if (id >= AP_N && id < AP_N + AI_NAUTO) {   /* (the host's value: the knob, and nothing said back) */
+        ai_from_host = 1;
+        ai_kset(AI_AUTO[id - AP_N].k, (int)(v + (v < 0.0f ? -0.5f : 0.5f)));
+        ai_from_host = 0;
+    }
 }
 
 void vibe_on_event(const vibe_event *e)
@@ -828,6 +999,9 @@ void vibe_on_init(float sample_rate)
     int i;
     ai_pass = sample_rate > 44099.5f && sample_rate < 44100.5f;
     ai_step = 44100.0 / (double)sample_rate;
+    ai_hsr = sample_rate;
+    ai_hplay = ai_htempo = 0;
+    ai_hhas = 0;
     ai_xstep = (double)sample_rate / 44100.0;
     if (!ai_pass) {
         ai_table(ai_h, ai_dh, sample_rate < 44100.0f ? 0.45 * (double)sample_rate / 44100.0 : 0.45);
@@ -847,7 +1021,7 @@ void vibe_on_init(float sample_rate)
     ai_qw = ai_qr = 0;
     for (i = 0; i < EN_NPIECES; i++)
         ai_piece_ch[i] = en_piece_name(i);
-    vibe_params(AI_PARAMS, AP_N);
+    ai_params_init();
     ai_gain = (uint32_t)(vibe_param_get(AP_VOLUME) * 4096.0f + 0.5f);
     ai_param(AP_INPUT, vibe_param_get(AP_INPUT));
     ai_param(AP_INDRY, vibe_param_get(AP_INDRY));
@@ -899,6 +1073,9 @@ void vibe_on_init(float sample_rate)
         en_regrow();
         if (have)
             vibe_param_set(AP_PIECE, (float)ai_piece);
+        ai_atempo = ai_par[P_TEMPO];
+        ai_from_host = 0;
+        ai_tell_all();
     }
     en_play(1);
     ai_leds();
@@ -1002,7 +1179,7 @@ void vibe_on_draw(uint16_t *fb)
     q = ai_cat(q, " ");
     q = ai_cat(q, EN_MODE_NAME[ai_par[P_MODE] % EN_NMODES]);
     q = ai_cat(q, "  ");
-    vg_itoa(ai_par[P_TEMPO], q);
+    vg_itoa(ai_hhas ? (int)(ai_hbpm + 0.5f) : ai_par[P_TEMPO], q);   /* (the host leads: its tempo) */
     vg_text(s, 468, 10, VG_BOLD, 0x06140C, VG_RIGHT);
 
     /* the arc: the section, its eight bars; playing or resting, the dub held */
