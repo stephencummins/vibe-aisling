@@ -28,7 +28,7 @@ VIBE_PARALLEL_AUDIO
 #include "../../firmware/src/dsp/amb.c"
 
 /* ------------------------------------------------------------------------------------------------ commands --- */
-enum { AI_FX, AI_MOVE, AI_LKEY, AI_LMIDI, AI_PLAY, AI_FREEZE, AI_PIECE, AI_SET, AI_MACRO, AI_CLOCK, AI_PANIC, AI_CHORUS };
+enum { AI_FX, AI_MOVE, AI_LKEY, AI_LMIDI, AI_PLAY, AI_FREEZE, AI_PIECE, AI_SET, AI_MACRO, AI_CLOCK, AI_PANIC, AI_CHORUS, AI_POOL, AI_REGROW };
 typedef struct {
     uint16_t op;
     int16_t a;
@@ -91,6 +91,12 @@ static void ai_do(const ai_cmd *c)
     case AI_CLOCK: en_clock(c->a); break;
     case AI_PANIC: en_panic(); break;
     case AI_CHORUS: en_chorus((int)c->v); break;
+    case AI_POOL: en_pool((uint16_t)c->v); break;
+    case AI_REGROW:                              /* (a piece's saved edits set: its loops grown from them, as ui.c's
+                                                  * set_piece) */
+        en_seed(ai_frames);
+        en_regrow();
+        break;
     }
 }
 
@@ -370,9 +376,108 @@ static void ai_fx_send(void)
     ai_post(AI_MOVE, 0, (int32_t)ai_mv);
 }
 
-static void ai_set_piece(int i)                  /* (the actions back to 0 first, as ui.c's mac_home) */
+static char *ai_cat(char *d, const char *s)      /* (no libc's strcat: returns the end) */
 {
+    while (*s)
+        *d++ = *s++;
+    *d = 0;
+    return d;
+}
+
+/* -------------------------------------------------------------------------------------------------- saving --- */
+/* A piece's edits: a file each, "piece-1" .. "piece-8", written when the piece is left, when the host keeps its state
+ * (VIBE_EV_SAVE) and two seconds after the last change; none while the piece is as written. "state": the piece
+ * selected, the page's group, Tune and MIDI out (the FM-1's: not a piece's). In a DAW they travel with the song */
+#define AI_MAGIC 0x4C534941u                     /* "AISL" */
+#define AI_FORMAT 1u
+typedef struct {
+    uint32_t magic;
+    uint16_t format, n;
+    int16_t par[P_NPARAMS];
+} ai_pfile;
+typedef struct {
+    uint32_t magic;
+    uint16_t format;
+    uint8_t piece, grp;
+    int16_t tune, midi;
+} ai_sfile;
+static uint8_t ai_edited[EN_NPIECES];            /* the piece has a file */
+static int ai_dirty, ai_sdirty;                  /* the piece's edits, the state: not written yet */
+static uint32_t ai_dirty_at, ai_reset_until;     /* in output frames */
+
+static int ai_global(int p) { return p == P_TUNE || p == P_MIDI; }
+
+static const char *ai_pname(char *b, int i)
+{
+    char *q = ai_cat(b, "piece-");
+    q[0] = (char)('1' + i);
+    q[1] = 0;
+    return b;
+}
+
+static int ai_piece_read(int i, int16_t *par)    /* 1: the file's parameters, each within its range */
+{
+    static ai_pfile f;
+    char nm[12];
+    int p;
+    if (vibe_store_read(ai_pname(nm, i), &f, (int)sizeof f) != (int)sizeof f || f.magic != AI_MAGIC
+        || f.format != AI_FORMAT || f.n != P_NPARAMS)
+        return 0;
+    for (p = 0; p < P_NPARAMS; p++) {
+        const en_param_t *in = en_param_info(p);
+        par[p] = f.par[p] < in->lo ? in->lo : f.par[p] > in->hi ? in->hi : f.par[p];
+    }
+    return 1;
+}
+
+static void ai_store(void)                       /* (the events and the draw: never the audio) */
+{
+    if (ai_dirty) {
+        static ai_pfile f;
+        static int16_t rec[P_NPARAMS];
+        uint16_t pool;
+        char nm[12];
+        int p, same = 1;
+        en_piece(ai_piece, rec, &pool);
+        for (p = 0; p < P_NPARAMS; p++)
+            if (!ai_global(p) && rec[p] != ai_par[p])
+                same = 0;
+        ai_pname(nm, ai_piece);
+        if (same) {                              /* turned back to the piece as written: no file */
+            if (ai_edited[ai_piece])
+                vibe_store_delete(nm);
+            ai_edited[ai_piece] = 0;
+        } else {
+            f.magic = AI_MAGIC;
+            f.format = AI_FORMAT;
+            f.n = P_NPARAMS;
+            memcpy(f.par, ai_par, sizeof f.par);
+            if (!vibe_store_write(nm, &f, (int)sizeof f))
+                ai_edited[ai_piece] = 1;
+        }
+        ai_dirty = 0;
+    }
+    if (ai_sdirty) {
+        ai_sfile f;
+        memset(&f, 0, sizeof f);
+        f.magic = AI_MAGIC;
+        f.format = AI_FORMAT;
+        f.piece = (uint8_t)ai_piece;
+        f.grp = (uint8_t)ai_grp;
+        f.tune = ai_par[P_TUNE];
+        f.midi = ai_par[P_MIDI];
+        vibe_store_write("state", &f, (int)sizeof f);
+        ai_sdirty = 0;
+    }
+}
+
+/* piece i: the actions back to 0 first (ui.c's mac_home); its recipe, then its saved edits (saved: 0, as written) */
+static void ai_piece_go(int i, int saved)
+{
+    static int16_t ed[P_NPARAMS];
+    const int16_t tune = ai_par[P_TUNE], midi = ai_par[P_MIDI];
     uint16_t pool;
+    int n = 0;
     ai_piece = (i % EN_NPIECES + EN_NPIECES) % EN_NPIECES;
     en_piece(ai_piece, ai_par, &pool);           /* (pure: the recipe's table) */
     for (i = 0; i < EN_NMAC; i++)
@@ -385,6 +490,30 @@ static void ai_set_piece(int i)                  /* (the actions back to 0 first
         ai_post(AI_CHORUS, 0, 0);
     }
     ai_post(AI_PIECE, ai_piece, 0);
+    if (saved && ai_piece_read(ai_piece, ed)) {
+        for (i = 0; i < P_NPARAMS; i++)
+            if (!ai_global(i) && ed[i] != ai_par[i]) {
+                ai_par[i] = ed[i];
+                ai_post(AI_SET, i, ed[i]);
+                if (i == P_MODE)
+                    ai_post(AI_POOL, 0, EN_MODE_POOL[ed[i] % EN_NMODES]);
+                n++;
+            }
+        if (n)
+            ai_post(AI_REGROW, 0, 0);
+    }
+    ai_edited[ai_piece] = n != 0;
+    ai_par[P_TUNE] = tune;                       /* (not a piece's: as they were) */
+    ai_par[P_MIDI] = midi;
+}
+
+static void ai_set_piece(int i)
+{
+    ai_sdirty = 1;
+    ai_store();                                  /* (the piece left: its edits kept) */
+    ai_piece_go(i, 1);
+    ai_sdirty = 1;
+    ai_dirty_at = ai_frames;
 }
 
 static void ai_key(int k, int down)              /* the 25 keys, C to C: the white the Lead's scale degrees (ui.c's
@@ -427,17 +556,12 @@ static void ai_midi(const uint8_t *m)            /* (ui.c's midi_in) notes on an
         ai_post(AI_LMIDI, -1, 0);
 }
 
-static char *ai_cat(char *d, const char *s)      /* (no libc's strcat: returns the end) */
-{
-    while (*s)
-        *d++ = *s++;
-    *d = 0;
-    return d;
-}
-
 /* the pages (the FM-1's views, ui.c's VIEW_KNOB and KNOB_LABEL: its four knobs each): F1-F6 a group, pressed again its
  * next page. A knob is a parameter, or one of these */
-enum { AK_FILTER = P_NPARAMS, AK_WET, AK_ENERGY, AK_CHORUS, AK_IN, AK_INDRY, AK_NONE };
+enum { AK_FILTER = P_NPARAMS, AK_WET, AK_ENERGY, AK_CHORUS, AK_IN, AK_INDRY, AK_MODE, AK_NONE };
+/* the modes as the knob steps through them (ui.c's MODE_ORDER: the most common first) */
+static const uint8_t AI_MODE_ORDER[EN_NMODES] = {MODE_AEOLIAN, MODE_IONIAN, MODE_DORIAN, MODE_MIXOLYDIAN, MODE_PENT_MIN,
+                                                 MODE_PENT_MAJ, MODE_PHRYGIAN, MODE_LYDIAN, MODE_HEX_MAJ, MODE_HEX_MIN};
 typedef struct {
     const char *name;
     uint16_t k[4];
@@ -446,7 +570,7 @@ typedef struct {
 static const ai_page AI_PAGE[] = {
     {"Aisling", {AK_FILTER, P_EVOLVE, P_MOTION, P_DRIFT}, {"Filter", "Evolve", "Motion", "Drift"}},
     {"Perform", {AK_FILTER, AK_WET, AK_ENERGY, AK_CHORUS}, {"Filter", "Wet", "Energy", "Chorus"}},
-    {"Key", {P_TEMPO, P_ROOT, P_MODE, P_TRANS}, {"Tempo", "Root", "Mode", "Transpose"}},
+    {"Key", {P_TEMPO, P_ROOT, AK_MODE, P_TRANS}, {"Tempo", "Root", "Mode", "Transpose"}},
     {"Arc", {P_LDIN, P_BRIDGE, P_ARC, P_LMEM}, {"Lead in", "Bridge", "Arc", "Memory"}},
     {"Mix", {P_CHORD, P_SEQ, P_LEAD, P_SEQ2}, {"Drone", "Seq", "Lead", "Seq 2"}},
     {"Drone", {P_PEDAL, P_CRES, P_PHASER, P_CATT}, {"Pedal", "Reso", "Phaser", "Attack"}},
@@ -503,6 +627,12 @@ static int ai_kget(int k)
         return (int)(ai_in_lvl * 100.0f + 0.5f);
     if (k == AK_INDRY)
         return (int)(ai_in_dry * 100.0f + 0.5f);
+    if (k == AK_MODE) {
+        int i;
+        for (i = 0; i < EN_NMODES && AI_MODE_ORDER[i] != ai_par[P_MODE]; i++)
+            ;
+        return i < EN_NMODES ? i : 0;
+    }
     return 0;
 }
 
@@ -515,12 +645,24 @@ static void ai_kset(int k, int v)
         lo = en_param_info(k)->lo, hi = en_param_info(k)->hi;
     else if (k <= AK_ENERGY)
         lo = -50, hi = 50;
+    else if (k == AK_MODE)
+        hi = EN_NMODES - 1;
     v = v < lo ? lo : v > hi ? hi : v;
     if (v == ai_kget(k))
         return;
-    if (k < P_NPARAMS) {
+    if (k < P_NPARAMS || k == AK_MODE) {
+        if (k == AK_MODE) {                      /* (ui.c's set_mode: the mode and its scale) */
+            k = P_MODE;
+            v = AI_MODE_ORDER[v];
+            ai_post(AI_POOL, 0, EN_MODE_POOL[v]);
+        }
         ai_par[k] = (int16_t)v;
         ai_post(AI_SET, k, v);
+        if (ai_global(k))
+            ai_sdirty = 1;
+        else
+            ai_dirty = 1;
+        ai_dirty_at = ai_frames;
     } else if (k <= AK_ENERGY) {
         ai_mac[k - AK_FILTER] = v;
         ai_post(AI_MACRO, k - AK_FILTER, v);
@@ -551,6 +693,8 @@ static void ai_ktext(int k, char *b)             /* (ui.c's knob_text) */
         vg_itoa((v < 0 ? -v : v) * 2, b);
     } else if (k == AK_CHORUS && !v)
         ai_cat(b, "Off");
+    else if (k == AK_MODE)
+        ai_cat(b, EN_MODE_NAME[ai_par[P_MODE] % EN_NMODES]);
     else if (k < AK_NONE)
         vg_itoa(v, b);
 }
@@ -621,6 +765,22 @@ static void ai_button(int b, int down)
         else if (b - VB_F1 == ai_grp)
             ai_pg[ai_grp] = (ai_pg[ai_grp] + 1) % AI_GRP[ai_grp].n;
         ai_grp = b - VB_F1;
+        ai_sdirty = 1;
+        ai_dirty_at = ai_frames;
+        break;
+    case VB_K2:                                  /* twice: the piece as it was written, its file gone */
+        if (ai_frames < ai_reset_until) {
+            char nm[12];
+            if (ai_edited[ai_piece])
+                vibe_store_delete(ai_pname(nm, ai_piece));
+            ai_dirty = 0;
+            ai_reset_until = 0;
+            ai_piece_go(ai_piece, 0);
+            ai_say("As written:", en_piece_name(ai_piece));
+        } else {
+            ai_reset_until = ai_frames + (uint32_t)(1.5f * ai_sr);
+            ai_say("K2 again:", "the piece as written");
+        }
         break;
     case VB_HOME: ai_help = !ai_help; break;
     case VB_RETURN: ai_help = 0; break;
@@ -654,6 +814,10 @@ void vibe_on_event(const vibe_event *e)
     case VIBE_EV_ENCODER: ai_enc(e->id, e->value); break;
     case VIBE_EV_MIDI: ai_midi(e->midi); break;
     case VIBE_EV_PARAM: ai_param(e->id, e->value); break;
+    case VIBE_EV_SAVE:                           /* the host keeps the state now */
+        ai_sdirty = 1;
+        ai_store();
+        break;
     default: break;
     }
 }
@@ -689,23 +853,53 @@ void vibe_on_init(float sample_rate)
     ai_param(AP_INDRY, vibe_param_get(AP_INDRY));
     vibe_input_link(1);                          /* IN 1 and IN 2: left and right */
     vibe_label(VB_K1, "INPUT");
+    vibe_label(VB_K2, "RESET");
     for (i = 0; i < 6; i++)
         vibe_label(VB_F1 + i, AI_GRP[i].cap);
     ai_sr = sample_rate;
     ai_grp = 0;
+    ai_dirty = ai_sdirty = 0;
+    ai_reset_until = 0;
+    memset(ai_edited, 0, sizeof ai_edited);
     memset(ai_pg, 0, sizeof ai_pg);
     memset(ai_mac, 0, sizeof ai_mac);
     ai_chorus = 0;
     ai_say_until = 0;
-    /* (host/en_render.c's boot, call for call: the FM-1's sound from the first sample) */
-    ai_piece = 0;
-    en_init();
-    en_piece(ai_piece, ai_par, &pool);
-    for (i = 0; i < P_NPARAMS; i++)
-        if (i != P_TUNE && i != P_MIDI)
-            en_set(i, ai_par[i]);
-    en_pool(pool);
-    en_regrow();
+    /* (host/en_render.c's boot, call for call: the FM-1's sound from the first sample. With files kept: the piece
+     * left, its edits, Tune and MIDI out) */
+    {
+        static int16_t ed[P_NPARAMS];
+        ai_sfile st;
+        const int have = vibe_store_read("state", &st, (int)sizeof st) == (int)sizeof st && st.magic == AI_MAGIC
+            && st.format == AI_FORMAT && st.piece < EN_NPIECES && st.grp < 6;
+        ai_piece = have ? st.piece : 0;
+        if (have)
+            ai_grp = st.grp;
+        en_init();
+        en_piece(ai_piece, ai_par, &pool);
+        if (ai_piece_read(ai_piece, ed))
+            for (i = 0; i < P_NPARAMS; i++)
+                if (!ai_global(i) && ed[i] != ai_par[i]) {
+                    ai_par[i] = ed[i];
+                    ai_edited[ai_piece] = 1;
+                    if (i == P_MODE)
+                        pool = EN_MODE_POOL[ed[i] % EN_NMODES];
+                }
+        for (i = 0; i < P_NPARAMS; i++)
+            if (!ai_global(i))
+                en_set(i, ai_par[i]);
+        if (have)
+            for (i = P_TUNE; i <= P_MIDI; i += P_MIDI - P_TUNE) {
+                const en_param_t *in = en_param_info(i);
+                const int16_t v = i == P_TUNE ? st.tune : st.midi;
+                ai_par[i] = v < in->lo ? in->lo : v > in->hi ? in->hi : v;
+                en_set(i, ai_par[i]);
+            }
+        en_pool(pool);
+        en_regrow();
+        if (have)
+            vibe_param_set(AP_PIECE, (float)ai_piece);
+    }
     en_play(1);
     ai_leds();
 }
@@ -746,6 +940,7 @@ static const char *const AI_HELP[] = {
     "REC", "hold the dub",
     "MIDI IN", "Lead notes, clock",
     "K1", "IN 1/2 into the FX",
+    "K2 twice", "piece as written",
 };
 
 static void ai_trim(char *d, const char *t, int n)   /* (Link's names: up to n characters) */
@@ -797,7 +992,12 @@ void vibe_on_draw(uint16_t *fb)
     /* the header: the page's colour; the piece; its key and tempo */
     vg_rect(0, 0, 480, 36, AI_GREEN);
     vg_text("AISLING", 12, 10, VG_BOLD, 0x06140C, VG_LEFT);
-    vg_text(en_piece_name(ai_piece), 240, 9, VG_MED, 0x06140C, VG_CENTER);
+    if ((ai_dirty || ai_sdirty) && ai_frames - ai_dirty_at > (uint32_t)(2.0f * ai_sr))
+        ai_store();                              /* (two seconds after the last change) */
+    q = ai_cat(s, en_piece_name(ai_piece));
+    if (ai_dirty || ai_edited[ai_piece])         /* (edited: not as written) */
+        ai_cat(q, " *");
+    vg_text(s, 240, 9, VG_MED, 0x06140C, VG_CENTER);
     q = ai_cat(s, EN_NOTE_NAME[ai_par[P_ROOT] % 12]);
     q = ai_cat(q, " ");
     q = ai_cat(q, EN_MODE_NAME[ai_par[P_MODE] % EN_NMODES]);
