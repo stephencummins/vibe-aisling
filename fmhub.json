@@ -3,5 +3,6 @@
   "author": "CU_STE",
   "kinds": ["synth"],
   "image": "docs/card.png",
-  "color": "#1EA462"
+  "color": "#1EA462",
+  "sounds": "own: the visualiser's demo recording is AISLING itself playing Skellig, rendered from its own code; the firmware uses no samples"
 }
