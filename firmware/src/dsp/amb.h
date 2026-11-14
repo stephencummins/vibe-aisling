@@ -195,6 +195,13 @@ void en_render(int32_t *out_lr, uint32_t n, uint32_t gain_q12);
 /* (0.5) USB audio's pair: where en_render also writes its n frames before MASTER, at a fixed level (0: not made).
  * Set it before the render */
 extern int32_t *en_usb_out;
+#ifdef EN_IN
+/* (VIBE FM) a sound from outside, put through the effects beside the voices: the render's n frames, left and right,
+ * full scale 1 (0: none, and the render is what it is without this). Set them before the render */
+extern const float *en_in_l, *en_in_r;
+extern float en_in_dry;                          /* how much of it goes straight to the output, 0 .. 1 (1 at start); the
+                                                  * echo and the plate are fed whatever this says, so 0 is all wet */
+#endif
 
 /* MIDI out, from the render: the app sends it (USB); status, data 1, data 2 */
 void en_midi_out(uint32_t st, uint32_t d1, uint32_t d2);

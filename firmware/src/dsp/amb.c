@@ -5650,6 +5650,13 @@ static float mf_lp = 14.2f, mf_hp = 4.3f;        /* the master filter: log2 of i
 static float mf_c[2][4], mf_s[8], mf_u[8];      /* (mf_u: the USB pair's own) */
 int32_t *en_usb_out;
 static int32_t *usb_at;
+#ifdef EN_IN                                    /* (VIBE FM) a sound from outside, beside the voices: see amb.h */
+const float *en_in_l, *en_in_r;
+float en_in_dry = 1.0f;
+static const float *in_at_l, *in_at_r;
+static float indry_s = 1.0f;                     /* (as it sounds: eased, so a turn does not step) */
+#define IN_SEND 0.5f                             /* of it into the echo and the plate, before their own amounts */
+#endif
 #define USB_GAIN 1.0f                            /* (0.5) the USB pair's level: as the analogue at MASTER 2048 */
 static float fx_vt, fx_wash, fx_cf, fx_rep, fx_sw, fx_swl, fx_swm = 1.0f, fx_ph, fx_phl, fx_phz[2][6], fx_phlast[2];
 static float tw_amp, tw_env, tw_f, tw_glide, tw_ph, tw_pan;
@@ -6948,6 +6955,23 @@ static void render_chunk(int32_t *out, uint32_t n, float gain)
     else
         render_atmos(n);
     layer_act();
+#ifdef EN_IN
+    /* the sound from outside joins the music here: its dry, and its mean into the echo and the plate, which the
+     * piece's Echo and Reverb (and the grid, and the moves) turn up as they do the voices'. None: nothing is added,
+     * and the music is to the bit what it is without this */
+    if (in_at_l) {
+        for (j = 0; j < n; j++) {
+            const float il = in_at_l[j], ir = in_at_r[j], s = (il + ir) * (0.5f * IN_SEND);
+            indry_s += (en_in_dry - indry_s) * 0.002f;
+            mixl[j] += il * indry_s;
+            mixr[j] += ir * indry_s;
+            rsend[j] += s;
+            esend[j] += s;
+        }
+        in_at_l += n;
+        in_at_r += n;
+    }
+#endif
     if (fxm & 0xFFFFu || tw_env > 1e-4f || fx_ph > 0.005f)   /* (the grid's sixteen) */
         render_fx(n);
     eg += (1.0f - eg) * fx_wash;                 /* Wash: everything into the echo */
@@ -7094,6 +7118,10 @@ void en_render(int32_t *out, uint32_t n, uint32_t gain_q12)
 {
     const float gain = (float)gain_q12 * (1.0f / 4096.0f) * 2.0f;
     usb_at = en_usb_out;
+#ifdef EN_IN
+    in_at_l = en_in_l && en_in_r ? en_in_l : 0;
+    in_at_r = en_in_r;
+#endif
     if (en_load > 75u)                           /* (the last block ran heavy: shed for half a second; the classics
                                                   * pass: from 75, was 80, and shedding more) */
         shed_left = (int32_t)(0.5f * EN_SR);

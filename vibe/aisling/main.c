@@ -5,6 +5,10 @@
  * The engine renders at its own 44.1 kHz, in the FM-1's blocks of 256. At 44.1 kHz its samples go out as they are, bit
  * for bit the FM-1's; at any other rate a windowed-sinc resampler takes them to the host's.
  *
+ * IN 1 and IN 2 (what the FM-1 has not): their sound joins the music before the effects, so the piece's echo and plate,
+ * the grid on the pads and the moves play on a voice or a guitar as they do on the harps. With no input, or a silent
+ * one, the engine is not told of it, and the sound stays the FM-1's to the bit.
+ *
  * Two flows (VIBE_PARALLEL_AUDIO): the events hand the audio commands through one ring (one writer, one reader); only
  * the audio calls the engine's commands (so its own queue, written and drained there, never crosses a flow); the
  * drawing reads the engine's volatile state, as the FM-1's screen does. */
@@ -17,6 +21,7 @@ VIBE_PARALLEL_AUDIO
  * -ffast-math, which would let the compiler reorder the engine's sums and divide by reciprocals: the sound would no
  * longer be the FM-1's). (wasm has no fused multiply-add, so nothing contracts) */
 #define EN_HOST 1
+#define EN_IN 1                                  /* (the engine's one addition here: amb.h's en_in_l, en_in_r) */
 #pragma clang fp reassociate(off)
 #pragma clang fp reciprocal(off)
 #pragma clang fp contract(off)
@@ -115,6 +120,21 @@ static uint32_t ai_fw, ai_ip;                    /* frames written; the read pos
 static double ai_fp, ai_step;                    /* its fraction; 44100 / the host's rate */
 static int ai_pass;                              /* the host at 44.1 kHz: the engine's samples as they are */
 static float ai_h[AI_PH + 1][AI_TAPS], ai_dh[AI_PH][AI_TAPS];
+/* the inputs, the other way: the host's rate to the engine's, into a ring the engine's blocks take from. The ring
+ * starts AI_LEAD frames ahead (silence), since the engine renders a block before the host has given its input */
+#define AI_LEAD 384u                             /* (at 44.1 kHz: one block, 256) */
+#define AI_HN 64u                                /* the inputs at the host's rate, the resampler's reach (a power of two) */
+static float ai_g[AI_PH + 1][AI_TAPS], ai_dg[AI_PH][AI_TAPS];
+static float ai_xl[AI_HN], ai_xr[AI_HN];
+static uint32_t ai_xw, ai_xp;                    /* host frames written; the read position's whole part */
+static double ai_xf, ai_xstep;                   /* its fraction; the host's rate / 44100 */
+static float ai_il[AI_RN], ai_ir[AI_RN];         /* the inputs at 44.1 kHz: frame f of the engine's at f */
+static uint32_t ai_iw;                           /* frames written (it starts at AI_LEAD) */
+static float ai_el[AI_RQ], ai_er[AI_RQ];         /* a block's, as the engine reads them */
+static volatile int ai_in_want = 1;              /* (the controls) the inputs heard */
+static volatile float ai_in_lvl = 0.8f, ai_in_dry = 1.0f;   /* (the controls) their level on the bus; their dry */
+static volatile int ai_in_seen;                  /* (the audio) the host gives an input */
+static volatile float ai_in_pk[2];               /* (the audio) their peaks, falling: the meters */
 
 #define AI_PI 3.14159265358979323846
 static double ai_sin(double x)                   /* (no libm): to -pi .. pi, then its series */
@@ -132,7 +152,8 @@ static double ai_sin(double x)                   /* (no libm): to -pi .. pi, the
     return s;
 }
 
-static void ai_table(double cut)                 /* cut: the low-pass, in cycles of the input's rate (0.5: Nyquist) */
+static void ai_table(float (*ai_h)[AI_TAPS], float (*ai_dh)[AI_TAPS], double cut)   /* cut: the low-pass, in cycles of
+                                                  * the input's rate (0.5: Nyquist) */
 {
     int p, k;
     for (p = 0; p <= AI_PH; p++) {
@@ -156,7 +177,18 @@ static void ai_table(double cut)                 /* cut: the low-pass, in cycles
 static void ai_render(void)                      /* one engine block into the ring */
 {
     uint32_t k;
+    int live = 0;
     ai_drain();
+    for (k = 0; k < AI_RQ; k++) {                /* this block's inputs (what the host has not given yet: silence) */
+        const uint32_t f = ai_fw + k, i = f & (AI_RN - 1u);
+        const int have = (int32_t)(ai_iw - f) > 0;
+        ai_el[k] = have ? ai_il[i] : 0.0f;
+        ai_er[k] = have ? ai_ir[i] : 0.0f;
+        live |= ai_el[k] != 0.0f || ai_er[k] != 0.0f;
+    }
+    en_in_l = live ? ai_el : 0;
+    en_in_r = live ? ai_er : 0;
+    en_in_dry = ai_in_dry;
     en_render(ai_blk, AI_RQ, ai_gain);
     for (k = 0; k < AI_RQ; k++) {
         const uint32_t i = (ai_fw + k) & (AI_RN - 1u);
@@ -168,13 +200,88 @@ static void ai_render(void)                      /* one engine block into the ri
 
 static float ai_clip(float x) { return x > 1.0f ? 1.0f : x < -1.0f ? -1.0f : x; }
 
+static float ai_sane(float x)                    /* an input's sample: within full scale; not a number: silence (by its
+                                                  * bits: the build's fast maths takes a NaN test away) */
+{
+    union {
+        float f;
+        uint32_t u;
+    } v;
+    v.f = x;
+    if ((v.u & 0x7F800000u) == 0x7F800000u)
+        return 0.0f;
+    return ai_clip(x);
+}
+
+static void ai_in_put(float l, float r)          /* a frame at 44.1 kHz into the engine's ring */
+{
+    const uint32_t i = ai_iw++ & (AI_RN - 1u);
+    ai_il[i] = l;
+    ai_ir[i] = r;
+}
+
+static void ai_in_frame(float l, float r)        /* a frame of the inputs, at the host's rate */
+{
+    if (ai_pass) {
+        ai_in_put(l, r);
+        return;
+    }
+    ai_xl[ai_xw & (AI_HN - 1u)] = l;
+    ai_xr[ai_xw & (AI_HN - 1u)] = r;
+    ai_xw++;
+    while ((int32_t)(ai_xw - ai_xp) >= AI_HALF + 1) {
+        const double ph = ai_xf * AI_PH;
+        const int p = (int)ph;
+        const float t = (float)(ph - p);
+        const float *h = ai_g[p], *dh = ai_dg[p];
+        const uint32_t base = ai_xp - (AI_HALF - 1);
+        float a = 0.0f, b = 0.0f;
+        uint32_t whole;
+        int k;
+        for (k = 0; k < AI_TAPS; k++) {
+            const float c = h[k] + t * dh[k];
+            const uint32_t i = (base + (uint32_t)k) & (AI_HN - 1u);
+            a += c * ai_xl[i];
+            b += c * ai_xr[i];
+        }
+        ai_in_put(a, b);
+        ai_xf += ai_xstep;
+        whole = (uint32_t)ai_xf;
+        ai_xp += whole;
+        ai_xf -= whole;
+    }
+}
+
 void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
 {
+    const float *in2 = vibe_input(1);
+    const int heard = ai_in_want && (in || in2);
+    const float lvl = ai_in_lvl;
+    float pl = ai_in_pk[0], pr = ai_in_pk[1];
     int n;
-    (void)in;
+    ai_in_seen = in || in2;
+    if (!in)                                     /* one jack only: it, in the middle */
+        in = in2;
+    if (!in2)
+        in2 = in;
+    if (heard)
+        for (n = 0; n < frames; n++) {           /* (the meters: the inputs as they come, before their level) */
+            const float a = ai_sane(in[n]), b = ai_sane(in2[n]);
+            pl = (a < 0.0f ? -a : a) > pl ? (a < 0.0f ? -a : a) : pl;
+            pr = (b < 0.0f ? -b : b) > pr ? (b < 0.0f ? -b : b) : pr;
+        }
+    {                                            /* (down 20 dB in a third of a second) */
+        const float fall = 1.0f - 6.9f * (float)frames * (float)ai_step / (0.33f * 44100.0f);
+        ai_in_pk[0] = pl * (fall > 0.0f ? fall : 0.0f);
+        ai_in_pk[1] = pr * (fall > 0.0f ? fall : 0.0f);
+    }
     if (ai_pass) {
         for (n = 0; n < frames; n++) {
             uint32_t i;
+            if (heard)
+                ai_in_frame(ai_sane(in[n]) * lvl, ai_sane(in2[n]) * lvl);
+            else
+                ai_in_frame(0.0f, 0.0f);
             if (ai_ip == ai_fw)
                 ai_render();
             i = ai_ip++ & (AI_RN - 1u);
@@ -191,6 +298,10 @@ void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
             float l = 0.0f, r = 0.0f;
             uint32_t whole;
             int k;
+            if (heard)
+                ai_in_frame(ai_sane(in[n]) * lvl, ai_sane(in2[n]) * lvl);
+            else
+                ai_in_frame(0.0f, 0.0f);
             while ((int32_t)(ai_fw - ai_ip) < AI_HALF + 1)
                 ai_render();
             for (k = 0; k < AI_TAPS; k++) {
@@ -218,10 +329,12 @@ static int ai_help;                              /* HOME's overview open */
 static float ai_acc[4];                          /* the encoders' fractions of a detent */
 static const char *ai_piece_ch[EN_NPIECES];
 
-enum { AP_VOLUME, AP_PIECE, AP_N };
+enum { AP_VOLUME, AP_PIECE, AP_INPUT, AP_INDRY, AP_N };
 static const vibe_param AI_PARAMS[AP_N] = {
     {"volume", "Volume", 0.0f, 1.0f, 0.5f, "", 0, 0},
     {"piece", "Piece", 0.0f, (float)(EN_NPIECES - 1), 0.0f, "", EN_NPIECES, ai_piece_ch},
+    {"input", "Input", 0.0f, 1.0f, 0.8f, "", 0, 0},
+    {"indry", "Input dry", 0.0f, 1.0f, 1.0f, "", 0, 0},
 };
 
 /* the effects grid: the pads, a row a group (the FM-1's grid, in its order: EN_FX_*). Echo, Filter, Space, Moves */
@@ -242,6 +355,7 @@ static void ai_leds(void)
         vibe_led_pad(p, AI_GROUP_RGB[p >> 2], ai_fxp >> p & 1u ? 1.0f : 0.18f);
     vibe_led_button(VB_PLAY, 0x1EA462, en_playing ? 1.0f : 0.15f);
     vibe_led_button(VB_REC, 0xFF3B30, en_frozen ? 1.0f : 0.15f);
+    vibe_led_button(VB_K1, 0x3FD0E0, ai_in_want && ai_in_seen ? 1.0f : 0.15f);
 }
 
 static void ai_fx_send(void)
@@ -350,6 +464,13 @@ static void ai_button(int b, int down)
         ai_set_piece(ai_piece + (b == VB_RIGHT ? 1 : -1));
         vibe_param_set(AP_PIECE, (float)ai_piece);
         break;
+    case VB_K1:                                  /* the inputs: asked for (a browser asks its user), then on and off */
+        if (!ai_in_seen) {
+            ai_in_want = 1;
+            vibe_request(VIBE_REQ_AUDIO_INPUT);
+        } else
+            ai_in_want = !ai_in_want;
+        break;
     case VB_HOME: ai_help = !ai_help; break;
     case VB_RETURN: ai_help = 0; break;
     }
@@ -364,7 +485,10 @@ static void ai_param(int id, float v)
         const int i = (int)(v + 0.5f);
         if (i != ai_piece)
             ai_set_piece(i);
-    }
+    } else if (id == AP_INPUT)
+        ai_in_lvl = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+    else if (id == AP_INDRY)
+        ai_in_dry = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
 }
 
 void vibe_on_event(const vibe_event *e)
@@ -386,8 +510,18 @@ void vibe_on_init(float sample_rate)
     int i;
     ai_pass = sample_rate > 44099.5f && sample_rate < 44100.5f;
     ai_step = 44100.0 / (double)sample_rate;
-    if (!ai_pass)
-        ai_table(sample_rate < 44100.0f ? 0.45 * (double)sample_rate / 44100.0 : 0.45);
+    ai_xstep = (double)sample_rate / 44100.0;
+    if (!ai_pass) {
+        ai_table(ai_h, ai_dh, sample_rate < 44100.0f ? 0.45 * (double)sample_rate / 44100.0 : 0.45);
+        ai_table(ai_g, ai_dg, sample_rate > 44100.0f ? 0.45 * 44100.0 / (double)sample_rate : 0.45);
+    }
+    memset(ai_xl, 0, sizeof ai_xl);
+    memset(ai_xr, 0, sizeof ai_xr);
+    memset(ai_il, 0, sizeof ai_il);
+    memset(ai_ir, 0, sizeof ai_ir);
+    ai_xw = ai_xp = AI_HALF;
+    ai_xf = 0.0;
+    ai_iw = ai_pass ? AI_RQ : AI_LEAD;
     ai_fw = ai_ip = 0;
     ai_fp = 0.0;
     memset(ai_fl, 0, sizeof ai_fl);
@@ -397,6 +531,10 @@ void vibe_on_init(float sample_rate)
         ai_piece_ch[i] = en_piece_name(i);
     vibe_params(AI_PARAMS, AP_N);
     ai_gain = (uint32_t)(vibe_param_get(AP_VOLUME) * 4096.0f + 0.5f);
+    ai_param(AP_INPUT, vibe_param_get(AP_INPUT));
+    ai_param(AP_INDRY, vibe_param_get(AP_INDRY));
+    vibe_input_link(1);                          /* IN 1 and IN 2: left and right */
+    vibe_label(VB_K1, "INPUT");
     /* (host/en_render.c's boot, call for call: the FM-1's sound from the first sample) */
     ai_piece = 0;
     ai_filter = 0;
@@ -452,6 +590,7 @@ static const char *const AI_HELP[] = {
     "STOP", "rest (tails ring on)",
     "REC", "hold the dub",
     "MIDI IN", "Lead notes, clock",
+    "K1", "IN 1/2 into the effects",
 };
 
 static int ai_drawn;
@@ -467,6 +606,7 @@ void vibe_on_draw(uint16_t *fb)
     }
     vibe_led_button(VB_PLAY, AI_GREEN, en_playing ? 1.0f : 0.15f);
     vibe_led_button(VB_REC, 0xFF3B30, en_frozen ? 1.0f : 0.15f);
+    vibe_led_button(VB_K1, 0x3FD0E0, ai_in_want && ai_in_seen ? 1.0f : 0.15f);
     if (ai_help) {
         vg_controls("AISLING", AI_HELP, (int)(sizeof AI_HELP / sizeof AI_HELP[0] / 2));
         return;
@@ -491,6 +631,16 @@ void vibe_on_draw(uint16_t *fb)
     vg_text(en_playing ? "PLAYING" : "RESTING", 468, 46, VG_BOLD, en_playing ? AI_GREEN : AI_DIM, VG_RIGHT);
     if (en_frozen)
         vg_text("HOLD", 380, 46, VG_BOLD, 0xFF3B30, VG_RIGHT);
+
+    /* the inputs, while they are heard: IN, and their two meters (red at full scale) */
+    if (ai_in_want && ai_in_seen) {
+        vg_text("IN", 262, 46, VG_BOLD, 0x3FD0E0, VG_LEFT);
+        for (i = 0; i < 2; i++) {
+            const float a = ai_in_pk[i] < 0.0f ? 0.0f : ai_in_pk[i] > 1.0f ? 1.0f : ai_in_pk[i];
+            vg_rect(284, 48 + i * 7, 44, 5, 0x1C2621);
+            vg_rect(284, 48 + i * 7, (int)(44.0f * a), 5, a > 0.98f ? 0xFF3B30 : 0x3FD0E0);
+        }
+    }
 
     /* the chord, and how near the next */
     vg_text(ai_chord(s), 240, 74, VG_BIG | VG_X2, AI_TEXT, VG_CENTER);
