@@ -28,7 +28,7 @@ VIBE_PARALLEL_AUDIO
 #include "../../firmware/src/dsp/amb.c"
 
 /* ------------------------------------------------------------------------------------------------ commands --- */
-enum { AI_FX, AI_MOVE, AI_LKEY, AI_LMIDI, AI_PLAY, AI_FREEZE, AI_PIECE, AI_SET, AI_MACRO, AI_CLOCK, AI_PANIC };
+enum { AI_FX, AI_MOVE, AI_LKEY, AI_LMIDI, AI_PLAY, AI_FREEZE, AI_PIECE, AI_SET, AI_MACRO, AI_CLOCK, AI_PANIC, AI_CHORUS };
 typedef struct {
     uint16_t op;
     int16_t a;
@@ -90,6 +90,7 @@ static void ai_do(const ai_cmd *c)
     case AI_MACRO: en_macro(c->a, (int)c->v); break;
     case AI_CLOCK: en_clock(c->a); break;
     case AI_PANIC: en_panic(); break;
+    case AI_CHORUS: en_chorus((int)c->v); break;
     }
 }
 
@@ -323,10 +324,15 @@ void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
 
 /* ----------------------------------------------------------------------------------- the control flow's side --- */
 static int16_t ai_par[P_NPARAMS];                /* the piece's parameters as the controls last set them */
-static int ai_piece, ai_filter;                  /* the piece; the Filter action (EN_MAC_FILTER), -50 .. 50 */
+static int ai_piece;
+static int ai_mac[EN_NMAC], ai_chorus;           /* the master actions, -50 .. 50 (Filter, Wet, Energy); the Chorus, 0 .. 100 */
+static int ai_grp, ai_pg[6];                     /* the pages: F1-F6's group, and each group's page */
+static char ai_said[40];                         /* a line for a moment (encoders A and B: what they set) */
+static uint32_t ai_say_until;                    /* in output frames */
+static float ai_sr;
 static uint32_t ai_fxp, ai_fxb, ai_mv;           /* the effects held: on the pads, on the black keys; the moves */
 static int ai_help;                              /* HOME's overview open */
-static float ai_acc[4];                          /* the encoders' fractions of a detent */
+static float ai_acc[VE_COUNT];                   /* the encoders' fractions of a detent */
 static const char *ai_piece_ch[EN_NPIECES];
 
 enum { AP_VOLUME, AP_PIECE, AP_INPUT, AP_INDRY, AP_N };
@@ -369,9 +375,14 @@ static void ai_set_piece(int i)                  /* (the actions back to 0 first
     uint16_t pool;
     ai_piece = (i % EN_NPIECES + EN_NPIECES) % EN_NPIECES;
     en_piece(ai_piece, ai_par, &pool);           /* (pure: the recipe's table) */
-    if (ai_filter) {
-        ai_filter = 0;
-        ai_post(AI_MACRO, EN_MAC_FILTER, 0);
+    for (i = 0; i < EN_NMAC; i++)
+        if (ai_mac[i]) {
+            ai_mac[i] = 0;
+            ai_post(AI_MACRO, i, 0);
+        }
+    if (ai_chorus) {
+        ai_chorus = 0;
+        ai_post(AI_CHORUS, 0, 0);
     }
     ai_post(AI_PIECE, ai_piece, 0);
 }
@@ -416,39 +427,167 @@ static void ai_midi(const uint8_t *m)            /* (ui.c's midi_in) notes on an
         ai_post(AI_LMIDI, -1, 0);
 }
 
-/* encoders 1-4 on the AISLING page: Filter, Evolve, Motion, Drift (ui.c's VIEW_KNOB[0]) */
-static const int AI_HOME_KNOB[4] = {-1, P_EVOLVE, P_MOTION, P_DRIFT};
-static const char *const AI_HOME_NAME[4] = {"Filter", "Evolve", "Motion", "Drift"};
+static char *ai_cat(char *d, const char *s)      /* (no libc's strcat: returns the end) */
+{
+    while (*s)
+        *d++ = *s++;
+    *d = 0;
+    return d;
+}
+
+/* the pages (the FM-1's views, ui.c's VIEW_KNOB and KNOB_LABEL: its four knobs each): F1-F6 a group, pressed again its
+ * next page. A knob is a parameter, or one of these */
+enum { AK_FILTER = P_NPARAMS, AK_WET, AK_ENERGY, AK_CHORUS, AK_IN, AK_INDRY, AK_NONE };
+typedef struct {
+    const char *name;
+    uint16_t k[4];
+    const char *lab[4];
+} ai_page;
+static const ai_page AI_PAGE[] = {
+    {"Aisling", {AK_FILTER, P_EVOLVE, P_MOTION, P_DRIFT}, {"Filter", "Evolve", "Motion", "Drift"}},
+    {"Perform", {AK_FILTER, AK_WET, AK_ENERGY, AK_CHORUS}, {"Filter", "Wet", "Energy", "Chorus"}},
+    {"Key", {P_TEMPO, P_ROOT, P_MODE, P_TRANS}, {"Tempo", "Root", "Mode", "Transpose"}},
+    {"Arc", {P_LDIN, P_BRIDGE, P_ARC, P_LMEM}, {"Lead in", "Bridge", "Arc", "Memory"}},
+    {"Mix", {P_CHORD, P_SEQ, P_LEAD, P_SEQ2}, {"Drone", "Seq", "Lead", "Seq 2"}},
+    {"Drone", {P_PEDAL, P_CRES, P_PHASER, P_CATT}, {"Pedal", "Reso", "Phaser", "Attack"}},
+    {"Drone sound", {P_CCOL, P_DREL, P_DRREV, P_DRECHO}, {"Colour", "Release", "Reverb", "Echo"}},
+    {"Drone move", {P_MW0, P_MT0, P_MR0, P_MI0}, {"Width", "Time", "Rate", "Intro"}},
+    {"Sequence", {P_DENSITY, P_SEQOCT, P_SEQLEN, P_SEQGRID}, {"Density", "Octave", "Length", "Grid"}},
+    {"Seq sound", {P_CUTOFF, P_DECAY, P_SQREV, P_SQECHO}, {"Cutoff", "Decay", "Reverb", "Echo"}},
+    {"Repeats", {P_TAPA, P_TAPAT, P_TAPB, P_TAPBT}, {"Repeat A", "A time", "Repeat B", "B time"}},
+    {"Seq move", {P_MW1, P_MT1, P_MR1, P_MI1}, {"Width", "Time", "Rate", "Intro"}},
+    {"Lead", {P_LDENS, P_LOCT, P_ORN, P_VIB}, {"Phrases", "Octave", "Ornament", "Vibrato"}},
+    {"Lead sound", {P_LTONE, P_LATT, P_LDREV, P_LDECHO}, {"Tone", "Attack", "Reverb", "Echo"}},
+    {"Lead style", {P_ORN, P_GLIDE, P_VIB, P_LMEM}, {"Ornament", "Glide", "Vibrato", "Memory"}},
+    {"Lead move", {P_MW2, P_MT2, P_MR2, P_MI2}, {"Width", "Time", "Rate", "Intro"}},
+    {"Sequence 2", {P_SCH1, P_SEQ2OCT, P_SEQ2LEN, P_SEQ2}, {"Chance", "Octave", "Length", "Level"}},
+    {"Seq2 sound", {P_S2CUT, P_S2DEC, P_S2REV, P_S2ECHO}, {"Cutoff", "Decay", "Reverb", "Echo"}},
+    {"Seq2 move", {P_MW3, P_MT3, P_MR3, P_MI3}, {"Width", "Time", "Rate", "Intro"}},
+    {"Space", {P_ECHO, P_ETIME, P_FEEDBACK, P_REVERB}, {"Echo", "Echo time", "Feedback", "Reverb"}},
+    {"Echo", {P_EBLUR, P_ETONE, P_EWIDTH, P_SIZE}, {"Blur", "Tone", "Width", "Size"}},
+    {"Atmosphere", {P_NGRAIN, P_NWIDTH, P_NDRIFT, P_NROOM}, {"Density", "Width", "Drift", "Air"}},
+    {"Atmos sound", {P_NCOL, P_NTUNE, P_NPLATE, P_NECHO}, {"Colour", "Ring", "Reverb", "Echo"}},
+    {"Atmos move", {P_MW4, P_MT4, P_MR4, P_MI4}, {"Width", "Time", "Rate", "Intro"}},
+    {"Input", {AK_IN, AK_INDRY, AK_NONE, AK_NONE}, {"Level", "Dry", "", ""}},
+    {"Setup", {P_TUNE, P_MIDI, AK_NONE, AK_NONE}, {"Tune", "MIDI out", "", ""}},
+};
+/* a group: its first page and how many; its caption; encoder A (its voice) and encoder B (its level) */
+static const struct {
+    uint8_t at, n;
+    const char *cap;
+    uint16_t a, b;
+    const char *an, *bn;
+    uint32_t rgb;
+} AI_GRP[6] = {
+    {0, 5, "PIECE", AK_NONE, AK_ENERGY, "Piece", "Energy", 0x1EA462},
+    {5, 3, "DRONE", P_CVOICE, P_CHORD, "Voice", "Level", 0x9B6BFF},
+    {8, 4, "SEQ", P_SVOICE, P_SEQ, "Voice", "Level", 0xFF5FA2},
+    {12, 4, "LEAD", P_LVOICE, P_LEAD, "Voice", "Level", 0xF2C14E},
+    {16, 3, "SEQ 2", P_S2VOICE, P_SEQ2, "Voice", "Level", 0x3FD0E0},
+    {19, 7, "SPACE", P_NCHAR, P_CRACKLE, "Atmosphere", "Atmos level", 0x9AA0A6},
+};
+_Static_assert(sizeof AI_PAGE / sizeof AI_PAGE[0] == 26, "the groups' pages: AI_GRP");
+
+static const ai_page *ai_page_now(void) { return &AI_PAGE[AI_GRP[ai_grp].at + ai_pg[ai_grp]]; }
+
+static void ai_param(int id, float v);
+static int ai_kget(int k)
+{
+    if (k < P_NPARAMS)
+        return ai_par[k];
+    if (k >= AK_FILTER && k <= AK_ENERGY)
+        return ai_mac[k - AK_FILTER];
+    if (k == AK_CHORUS)
+        return ai_chorus;
+    if (k == AK_IN)
+        return (int)(ai_in_lvl * 100.0f + 0.5f);
+    if (k == AK_INDRY)
+        return (int)(ai_in_dry * 100.0f + 0.5f);
+    return 0;
+}
+
+static void ai_kset(int k, int v)
+{
+    int lo = 0, hi = 100;
+    if (k >= AK_NONE)
+        return;
+    if (k < P_NPARAMS)
+        lo = en_param_info(k)->lo, hi = en_param_info(k)->hi;
+    else if (k <= AK_ENERGY)
+        lo = -50, hi = 50;
+    v = v < lo ? lo : v > hi ? hi : v;
+    if (v == ai_kget(k))
+        return;
+    if (k < P_NPARAMS) {
+        ai_par[k] = (int16_t)v;
+        ai_post(AI_SET, k, v);
+    } else if (k <= AK_ENERGY) {
+        ai_mac[k - AK_FILTER] = v;
+        ai_post(AI_MACRO, k - AK_FILTER, v);
+    } else if (k == AK_CHORUS) {
+        ai_chorus = v;
+        ai_post(AI_CHORUS, 0, v);
+    } else {                                     /* (the inputs' two: the host's parameters, so a DAW's too) */
+        const int id = k == AK_IN ? AP_INPUT : AP_INDRY;
+        vibe_param_set(id, (float)v * 0.01f);
+        ai_param(id, (float)v * 0.01f);
+    }
+}
+
+static void ai_ktext(int k, char *b)             /* (ui.c's knob_text) */
+{
+    const int v = ai_kget(k);
+    *b = 0;
+    if (k < P_NPARAMS)
+        en_param_text(k, v, b);
+    else if (k == AK_FILTER) {                   /* Off in the middle; Shut (the low-pass) down, Open up, 0..100 */
+        if (!v)
+            ai_cat(b, "Off");
+        else
+            vg_itoa((v < 0 ? -v : v) * 2, ai_cat(b, v < 0 ? "Shut " : "Open "));
+    } else if (k <= AK_ENERGY) {                 /* 0: the piece as it is; more or less of it, -100..+100 */
+        if (v)
+            *b++ = v < 0 ? '-' : '+';
+        vg_itoa((v < 0 ? -v : v) * 2, b);
+    } else if (k == AK_CHORUS && !v)
+        ai_cat(b, "Off");
+    else if (k < AK_NONE)
+        vg_itoa(v, b);
+}
+
+static void ai_say(const char *a, const char *b)
+{
+    char *q = ai_cat(ai_said, a);
+    q = ai_cat(q, "  ");
+    ai_cat(q, b);
+    ai_say_until = ai_frames + (uint32_t)(1.5f * ai_sr);
+}
 
 static void ai_enc(int id, float turn)
 {
-    int steps, p, v;
-    if (id < VE_1 || id > VE_4)
+    char t[16];
+    int steps, k;
+    if (id < VE_1 || id > VE_B)
         return;
     ai_acc[id] += turn;
     steps = (int)ai_acc[id];
     ai_acc[id] -= (float)steps;
     if (!steps)
         return;
-    p = AI_HOME_KNOB[id];
-    if (p < 0) {
-        v = ai_filter + steps;
-        v = v < -50 ? -50 : v > 50 ? 50 : v;
-        if (v != ai_filter) {
-            ai_filter = v;
-            ai_post(AI_MACRO, EN_MAC_FILTER, v);
-        }
+    if (id <= VE_4) {
+        ai_kset(ai_page_now()->k[id], ai_kget(ai_page_now()->k[id]) + steps);
         return;
     }
-    v = ai_par[p] + steps;
-    if (v < en_param_info(p)->lo)
-        v = en_param_info(p)->lo;
-    if (v > en_param_info(p)->hi)
-        v = en_param_info(p)->hi;
-    if (v != ai_par[p]) {
-        ai_par[p] = (int16_t)v;
-        ai_post(AI_SET, p, v);
+    k = id == VE_A ? AI_GRP[ai_grp].a : AI_GRP[ai_grp].b;
+    if (k == AK_NONE) {                          /* (PIECE's A: the piece) */
+        ai_set_piece(ai_piece + steps);
+        vibe_param_set(AP_PIECE, (float)ai_piece);
+        ai_say("Piece", en_piece_name(ai_piece));
+        return;
     }
+    ai_kset(k, ai_kget(k) + steps);
+    ai_ktext(k, t);
+    ai_say(id == VE_A ? AI_GRP[ai_grp].an : AI_GRP[ai_grp].bn, t);
 }
 
 static void ai_button(int b, int down)
@@ -470,6 +609,18 @@ static void ai_button(int b, int down)
             vibe_request(VIBE_REQ_AUDIO_INPUT);
         } else
             ai_in_want = !ai_in_want;
+        break;
+    case VB_F1:
+    case VB_F2:
+    case VB_F3:
+    case VB_F4:
+    case VB_F5:
+    case VB_F6:                                  /* a group; pressed again, its next page */
+        if (ai_help)
+            ai_help = 0;
+        else if (b - VB_F1 == ai_grp)
+            ai_pg[ai_grp] = (ai_pg[ai_grp] + 1) % AI_GRP[ai_grp].n;
+        ai_grp = b - VB_F1;
         break;
     case VB_HOME: ai_help = !ai_help; break;
     case VB_RETURN: ai_help = 0; break;
@@ -493,6 +644,9 @@ static void ai_param(int id, float v)
 
 void vibe_on_event(const vibe_event *e)
 {
+    int id;
+    if (!ai_help && vf_event(e, &id) != VF_NO)   /* (FOCUS: DATA walks the knobs and F1-F6; theirs come back as events) */
+        return;
     switch (e->type) {
     case VIBE_EV_KEY: ai_key(e->id, e->down); break;
     case VIBE_EV_PAD: ai_pad(e->id, e->down); break;
@@ -535,9 +689,16 @@ void vibe_on_init(float sample_rate)
     ai_param(AP_INDRY, vibe_param_get(AP_INDRY));
     vibe_input_link(1);                          /* IN 1 and IN 2: left and right */
     vibe_label(VB_K1, "INPUT");
+    for (i = 0; i < 6; i++)
+        vibe_label(VB_F1 + i, AI_GRP[i].cap);
+    ai_sr = sample_rate;
+    ai_grp = 0;
+    memset(ai_pg, 0, sizeof ai_pg);
+    memset(ai_mac, 0, sizeof ai_mac);
+    ai_chorus = 0;
+    ai_say_until = 0;
     /* (host/en_render.c's boot, call for call: the FM-1's sound from the first sample) */
     ai_piece = 0;
-    ai_filter = 0;
     en_init();
     en_piece(ai_piece, ai_par, &pool);
     for (i = 0; i < P_NPARAMS; i++)
@@ -557,14 +718,6 @@ void vibe_on_init(float sample_rate)
 static const uint32_t AI_LAYER_RGB[5] = {0x9B6BFF, 0xFF5FA2, 0xF2C14E, 0x3FD0E0, 0x9AA0A6};
 static const char *const AI_LAYER_NAME[5] = {"Drone", "Sequence", "Lead", "Seq 2", "Atmos"};
 
-static char *ai_cat(char *d, const char *s)      /* (no libc's strcat: returns the end) */
-{
-    while (*s)
-        *d++ = *s++;
-    *d = 0;
-    return d;
-}
-
 static const char *ai_chord(char *nm)            /* (ui.c's chord_now) the chord's name, "Em7" */
 {
     const int slot = en_chord_slot;
@@ -578,26 +731,36 @@ static const char *ai_chord(char *nm)            /* (ui.c's chord_now) the chord
 }
 
 static const char *const AI_HELP[] = {
-    "WHITE KEYS", "play the Lead",           /* (the overview's cells hold about 22 characters) */
-    "BLACK KEYS", "hold an effect, a move",
+    "WHITE KEYS", "play the Lead",           /* (the overview's cells hold about 20 characters) */
+    "BLACK KEYS", "an effect or a move",
     "PADS", "hold an effect",
-    "ENCODER 1", "Filter: shut / open",
-    "ENCODER 2", "Evolve: change",
-    "ENCODER 3", "Motion: arrangement",
-    "ENCODER 4", "Drift: a chord's length",
+    "F1 - F6", "a layer's pages",
+    "F again", "its next page",
+    "ENCODERS 1-4", "the page's four",
+    "ENCODER A", "the layer's voice",
+    "ENCODER B", "the layer's level",
+    "DATA", "walk the page",
     "< >", "the piece",
     "PLAY", "play / rest",
     "STOP", "rest (tails ring on)",
     "REC", "hold the dub",
     "MIDI IN", "Lead notes, clock",
-    "K1", "IN 1/2 into the effects",
+    "K1", "IN 1/2 into the FX",
 };
+
+static void ai_trim(char *d, const char *t, int n)   /* (Link's names: up to n characters) */
+{
+    while (n-- && *t)
+        *d++ = *t++;
+    *d = 0;
+}
 
 static int ai_drawn;
 
 void vibe_on_draw(uint16_t *fb)
 {
-    char s[48], *q;
+    const ai_page *const pg = ai_page_now();
+    char s[48], t[16], *q;
     int i, x;
     (void)fb;
     if (!ai_drawn) {
@@ -607,6 +770,24 @@ void vibe_on_draw(uint16_t *fb)
     vibe_led_button(VB_PLAY, AI_GREEN, en_playing ? 1.0f : 0.15f);
     vibe_led_button(VB_REC, 0xFF3B30, en_frozen ? 1.0f : 0.15f);
     vibe_led_button(VB_K1, 0x3FD0E0, ai_in_want && ai_in_seen ? 1.0f : 0.15f);
+    for (i = 0; i < 6; i++)
+        vibe_led_button(VB_F1 + i, AI_GRP[i].rgb, i == ai_grp ? 1.0f : 0.15f);
+    /* (Link: a controller's screen, the page and its knobs) */
+    vibe_link_page(pg->name);
+    for (i = 0; i < 4; i++) {
+        ai_ktext(pg->k[i], s);
+        ai_trim(t, s, 11);
+        vibe_link_encoder(VE_1 + i, pg->lab[i], t);
+    }
+    for (i = 0; i < 2; i++) {
+        const int k = i ? AI_GRP[ai_grp].b : AI_GRP[ai_grp].a;
+        if (k == AK_NONE)
+            ai_cat(s, en_piece_name(ai_piece));
+        else
+            ai_ktext(k, s);
+        ai_trim(t, s, 11);
+        vibe_link_encoder(VE_A + i, i ? AI_GRP[ai_grp].bn : AI_GRP[ai_grp].an, t);
+    }
     if (ai_help) {
         vg_controls("AISLING", AI_HELP, (int)(sizeof AI_HELP / sizeof AI_HELP[0] / 2));
         return;
@@ -662,16 +843,18 @@ void vibe_on_draw(uint16_t *fb)
                 q = ai_cat(q, " + ");
             q = ai_cat(q, i ? "Close" : "Rise");
         }
-    if (*s)
+    if (ai_frames < ai_say_until)                /* (encoder A or B turned: what it set, for a moment) */
+        vg_text(ai_said, 240, 138, VG_MED, AI_GRP[ai_grp].rgb, VG_CENTER);
+    else if (*s)
         vg_text(s, 240, 138, VG_MED, 0xFF8A1F, VG_CENTER);
 
     /* the sound: the scope */
     {
         const uint32_t w = en_scope_w;
-        float y0 = 186.0f;
+        float y0 = 180.0f;
         for (x = 0; x < 240; x++) {
             const float v = (float)en_scope[(w + (uint32_t)x) % EN_SCOPE_N] * (1.0f / 32768.0f);
-            const float y = 186.0f - 22.0f * (v < -1.0f ? -1.0f : v > 1.0f ? 1.0f : v);
+            const float y = 180.0f - 20.0f * (v < -1.0f ? -1.0f : v > 1.0f ? 1.0f : v);
             if (x)
                 vg_line((float)(x - 1) * 2.0f, y0, (float)x * 2.0f, y, 1.5f, 0x2F7A55);
             y0 = y;
@@ -682,26 +865,36 @@ void vibe_on_draw(uint16_t *fb)
     for (i = 0; i < 5; i++) {
         const float a = en_layer_act[i];
         x = 12 + i * 92;
-        vg_text(AI_LAYER_NAME[i], x, 206, VG_SMALL, AI_LAYER_RGB[i], VG_LEFT);
-        vg_rect(x, 224, 84, 5, 0x1C2621);
-        vg_rect(x, 224, (int)(84.0f * (a < 0.0f ? 0.0f : a > 1.0f ? 1.0f : a)), 5, AI_LAYER_RGB[i]);
+        vg_text(AI_LAYER_NAME[i], x, 200, VG_SMALL, AI_LAYER_RGB[i], VG_LEFT);
+        vg_rect(x, 218, 84, 4, 0x1C2621);
+        vg_rect(x, 218, (int)(84.0f * (a < 0.0f ? 0.0f : a > 1.0f ? 1.0f : a)), 4, AI_LAYER_RGB[i]);
     }
 
-    /* encoders 1-4: their values, over F1-F6 */
+    /* the page: encoders 1-4, their names and values; under them F1-F6's groups, this one's page and how many */
+    vf_begin();
     for (i = 0; i < 4; i++) {
-        const int p = AI_HOME_KNOB[i];
         x = i * 120;
-        vg_rect(x + 4, 238, 112, 42, 0x131C17);
-        vg_text(AI_HOME_NAME[i], x + 60, 241, VG_SMALL, AI_DIM, VG_CENTER);
-        if (p < 0) {
-            if (!ai_filter)
-                ai_cat(s, "Off");
-            else {
-                q = ai_cat(s, ai_filter < 0 ? "Shut " : "Open ");
-                vg_itoa((ai_filter < 0 ? -ai_filter : ai_filter) * 2, q);
-            }
-        } else
-            en_param_text(p, ai_par[p], s);
-        vg_text(s, x + 60, 256, VG_MED, AI_TEXT, VG_CENTER);
+        vg_rect(x + 4, 230, 112, 46, 0x131C17);
+        vg_rect(x + 4, 230, 112, 2, AI_GRP[ai_grp].rgb);
+        if (pg->k[i] == AK_NONE)
+            continue;
+        vg_text(pg->lab[i], x + 60, 236, VG_SMALL, AI_DIM, VG_CENTER);
+        ai_ktext(pg->k[i], s);
+        vg_text(s, x + 60, 252, VG_MED, AI_TEXT, VG_CENTER);
+        vf_encoder(VE_1 + i, x + 4, 230, 112, 46);
     }
+    for (i = 0; i < 6; i++) {
+        const int on = i == ai_grp;
+        x = i * 80;
+        vg_rect(x + 2, 282, 76, 36, on ? AI_GRP[i].rgb : 0x131C17);
+        if (on) {
+            int k;
+            vg_text(pg->name, x + 40, 285, VG_SMALL, 0x06140C, VG_CENTER);
+            for (k = 0; k < AI_GRP[i].n; k++)    /* its pages: a pip each */
+                vg_rect(x + 40 - AI_GRP[i].n * 4 + k * 8, 307, 6, 4, k == ai_pg[i] ? 0x06140C : 0x4A5A52);
+        } else
+            vg_text(AI_GRP[i].cap, x + 40, 292, VG_BOLD, AI_GRP[i].rgb, VG_CENTER);
+        vf_key(VB_F1 + i, x + 2, 282, 76, 36);
+    }
+    vf_end(AI_TEXT);
 }
