@@ -1,5 +1,5 @@
 {
-  "what": "A generative Irish ambient instrument for VIBE FM: harps in a jig's threes and a flute over a drone, with surf, wind and rain. Eight pieces play themselves for ever. Play along on the keys, hold effects on the pads, send your own sound through its echo and reverb, and let the DAW lead its tempo.",
+  "what": "A generative Irish ambient instrument for VIBE FM: harps in a jig's threes and a flute over a drone, with surf, wind and rain. Eight pieces play themselves for ever. Play along on the keys, hold effects on the pads, send your own sound through its echo and reverb, and let the DAW lead its tempo. A sequencer can play its harp and flute by MIDI channel.",
   "author": "CU_STE",
   "kinds": ["synth"],
   "image": "docs/card.png",

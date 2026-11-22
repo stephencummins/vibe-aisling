@@ -35,6 +35,7 @@ AMB-1 by Charles Vestal. GPL-3.0, as they are: see [LICENSE](../LICENSE) and [LI
   parameters to automate: the four master actions (Filter, Wet, Energy, Chorus), the five layers' levels, echo and
   reverb, tempo, root, mode and more.
 - **MIDI.** Notes in play the Lead; a MIDI clock in leads the tempo; with MIDI out on, the piece's notes go out.
+  From 1.3 a sequencer can play the layers: see "From a sequencer" below.
 
 ## Playing it
 
@@ -57,6 +58,37 @@ AMB-1 by Charles Vestal. GPL-3.0, as they are: see [LICENSE](../LICENSE) and [LI
 | HOME | this list, on the screen |
 
 The eight pieces: Skellig, Burren, Aran, Carolan, Blasket, Samhain, Connemara, Tir na nOg.
+
+## From a sequencer (1.3)
+
+A DAW's clip, or a live-coding tool, can play AISLING as an instrument while the piece goes on.
+
+| MIDI | |
+|---|---|
+| Channel 1, and 5 to 16 | the Lead, in the piece's scale (as before) |
+| Channel 2 | the Lead, the notes as sent |
+| Channel 3 | the Sequence, plucked, the notes as sent, by their velocity |
+| Channel 4 | Sequence 2, the same (silent in a piece that has none: Skellig, for one) |
+| Program change 1 to 8 | the piece (0 to 7 on the wire) |
+
+The parameter **Own notes** (`own`) holds back the notes the piece plays by itself on the Sequence, on Sequence 2 or
+on both, so that only yours sound there. The Lead needs no switch: it stops its own phrase when you play it and
+takes it up again two bars after you stop. The Drone and the Atmosphere always play.
+
+The tempo follows the host from 60 to 160; outside that it stays at the nearest end.
+
+### In Strudel (strdltn Live[code])
+
+[strdltn](https://github.com/alienmind/strdltn) plays VIBE FM firmwares from Strudel in VS Code:
+
+    firmware('https://github.com/stephencummins/vibe-aisling/releases/latest/download/aisling.zip')
+    $bass: note("<d2 d2 bb1 c2>*2").s("vibefm1:aisling").midichan(3)
+    $tune: note("d4 f4 a4 g4").s("vibefm1:aisling").midichan(2)
+
+`.midichan()` chooses the layer, `.velocity()` how hard a Sequence is plucked, `.progNum(0)` to `.progNum(7)` the
+piece. Own notes and the other parameters are sliders in its Devices tab. Effects written on the line (`.room()`
+and the like) do not reach a firmware. A longer example: [examples/aisling.strudel](examples/aisling.strudel).
+Loaded from The Firmware Hub's address the sound is named after the hub's file, not `vibefm1:aisling`.
 
 ## Building it
 
