@@ -203,6 +203,14 @@ extern float en_in_dry;                          /* how much of it goes straight
                                                   * echo and the plate are fed whatever this says, so 0 is all wet */
 #endif
 
+#ifdef EN_HOST
+/* (a computer's notes, as played and not to the scale) a note on a layer (1 the Sequence, 2 the Lead, 3 Sequence 2;
+ * vel 0: let go, the Lead's only), and the Sequences' own notes held back (bit 0 the Sequence's, bit 1
+ * Sequence 2's) while a hand plays them. As on main (the plugin's) */
+void en_note(int layer, int note, int vel);
+void en_hand(uint32_t mask);
+#endif
+
 /* MIDI out, from the render: the app sends it (USB); status, data 1, data 2 */
 void en_midi_out(uint32_t st, uint32_t d1, uint32_t d2);
 #ifdef EN_NOTES
