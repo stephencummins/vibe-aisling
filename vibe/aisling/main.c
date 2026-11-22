@@ -30,7 +30,7 @@ VIBE_PARALLEL_AUDIO
 #include "../../firmware/src/dsp/amb.c"
 
 /* ------------------------------------------------------------------------------------------------ commands --- */
-enum { AI_FX, AI_MOVE, AI_LKEY, AI_LMIDI, AI_PLAY, AI_FREEZE, AI_PIECE, AI_SET, AI_MACRO, AI_CLOCK, AI_PANIC, AI_CHORUS, AI_POOL, AI_REGROW };
+enum { AI_FX, AI_MOVE, AI_LKEY, AI_LMIDI, AI_PLAY, AI_FREEZE, AI_PIECE, AI_SET, AI_MACRO, AI_CLOCK, AI_PANIC, AI_CHORUS, AI_POOL, AI_REGROW, AI_NOTE, AI_HAND, AI_ETEMPO };
 typedef struct {
     uint16_t op;
     int16_t a;
@@ -56,6 +56,7 @@ static void ai_post(int op, int a, int32_t v)   /* (the control flow only) */
 static uint32_t ai_frames;                       /* output frames so far (the seed's entropy, as the FM-1's clock) */
 static int16_t ai_apar[P_NPARAMS];               /* a piece's recipe, as the audio loads it */
 static int ai_atempo, ai_htempo;                 /* the piece's own Tempo; the host's while it leads (0: it doesn't) */
+static int ai_etempo;                            /* (1.3) a tempo a host gave as an event only (VIBE_EV_TRANSPORT; 0: none) */
 static volatile uint32_t ai_gain = 2048u;        /* Q12, the FM-1's MASTER: Volume 0.5 is 2048, en_render's host's */
 
 static void ai_piece_load(int i)                 /* ui.c's set_piece: the recipe, its scale, its loops grown afresh;
@@ -104,6 +105,9 @@ static void ai_do(const ai_cmd *c)
         break;
     case AI_MACRO: en_macro(c->a, (int)c->v); break;
     case AI_CLOCK: en_clock(c->a); break;
+    case AI_NOTE: en_note((int)c->v >> 8, c->a, (int)c->v & 127); break;   /* (1.3) a note as played, on its layer */
+    case AI_HAND: en_hand((uint32_t)c->v); break;
+    case AI_ETEMPO: ai_etempo = (int)c->v; break;
     case AI_PANIC: en_panic(); break;
     case AI_CHORUS: en_chorus((int)c->v); break;
     case AI_POOL: en_pool((uint16_t)c->v); break;
@@ -251,9 +255,10 @@ static void ai_host_block(void)                  /* a host's block begins */
             en_set(P_TEMPO, b);
         }
         ai_hbpm = t->bpm;
-    } else if (ai_htempo) {                      /* it gave the tempo back: the piece's own again */
-        ai_htempo = 0;
-        en_set(P_TEMPO, ai_atempo);
+    } else if (ai_htempo != ai_etempo) {         /* it gave the tempo back: the piece's own again (or, 1.3, the one a
+                                                  * host without a position sent as an event) */
+        ai_htempo = ai_etempo;
+        en_set(P_TEMPO, ai_etempo ? ai_etempo : ai_atempo);
     }
     if (lead && t->playing) {
         const double pos = t->beat * 24.0;
@@ -678,9 +683,28 @@ static void ai_pad(int p, int down)
     ai_leds();
 }
 
-static void ai_midi(const uint8_t *m)            /* (ui.c's midi_in) notes on any channel: the Lead; clock: the grid */
+/* (ui.c's midi_in) notes: the Lead, to the scale; clock: the grid. (1.3, for a sequencer that plays it as an instrument:
+ * Strudel, a DAW's clip) channel 2 the Lead, 3 the Sequence and 4 Sequence 2 with the notes as played, not to the scale
+ * (en_note: the Lead holds, the Sequences are plucked, by their velocity); a program change 1..8 (0..7 on the wire)
+ * chooses the piece, as on the FM-1 */
+static void ai_midi(const uint8_t *m)
 {
-    const uint32_t st = m[0], hi = st & 0xF0u;
+    const uint32_t st = m[0], hi = st & 0xF0u, ch = st & 0x0Fu;
+    if (ch >= 1u && ch <= 3u && (hi == 0x90u || hi == 0x80u)) {
+        static const uint8_t LAYER[4] = {0, 2, 1, 3};
+        const int vel = hi == 0x90u ? m[2] & 0x7F : 0;
+        if (vel || ch == 1u)                     /* (a Sequence's note rings out by itself: no note off) */
+            ai_post(AI_NOTE, m[1] & 0x7F, LAYER[ch] << 8 | vel);
+        return;
+    }
+    if (hi == 0xC0u) {
+        const int i = m[1] & 0x7F;
+        if (i < EN_NPIECES && i != ai_piece) {
+            ai_set_piece(i);
+            vibe_param_set(AP_PIECE, (float)ai_piece);
+        }
+        return;
+    }
     if (st == 0xF8u || st == 0xFAu || st == 0xFBu || st == 0xFCu) {
         if (!ai_hhas)                            /* (the host counts the same clock into its position: once) */
             ai_post(AI_CLOCK, st == 0xF8u ? EN_CLK_TICK : st == 0xFAu ? EN_CLK_START : st == 0xFBu ? EN_CLK_CONTINUE : EN_CLK_STOP, 0);
@@ -858,7 +882,10 @@ static const struct {
     {"root", "Root", P_ROOT}, {"mode", "Mode", AK_MODE}, {"transpose", "Transpose", P_TRANS},
 };
 #define AI_NAUTO ((int)(sizeof AI_AUTO / sizeof AI_AUTO[0]))
-static vibe_param AI_PARAMS[AP_N + AI_NAUTO];
+#define AP_OWN (AP_N + AI_NAUTO)                 /* (1.3) the piece's own Sequence notes: appended, the ids before it as
+                                                  * they were */
+static const char *const ai_own_ch[4] = {"All", "No Sequence", "No Sequence 2", "No Sequences"};
+static vibe_param AI_PARAMS[AP_OWN + 1];
 static const char *ai_mode_ch[EN_NMODES];
 static int ai_from_host;
 
@@ -908,7 +935,18 @@ static void ai_params_init(void)                 /* (their defaults: the first p
         p->steps = k == AK_MODE ? EN_NMODES : 0;
         p->choices = k == AK_MODE ? ai_mode_ch : 0;
     }
-    vibe_params(AI_PARAMS, AP_N + AI_NAUTO);
+    {
+        vibe_param *p = &AI_PARAMS[AP_OWN];
+        p->id = "own";
+        p->name = "Own notes";
+        p->min = 0.0f;
+        p->max = 3.0f;
+        p->def = 0.0f;
+        p->unit = "";
+        p->steps = 4;
+        p->choices = ai_own_ch;
+    }
+    vibe_params(AI_PARAMS, AP_OWN + 1);
 }
 
 static void ai_say(const char *a, const char *b)
@@ -1031,7 +1069,10 @@ static void ai_param(int id, float v)
         ai_in_lvl = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
     else if (id == AP_INDRY)
         ai_in_dry = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
-    else if (id >= AP_N && id < AP_N + AI_NAUTO) {   /* (the host's value: the knob, and nothing said back) */
+    else if (id == AP_OWN) {                     /* (bit 0 the Sequence's own notes held back, bit 1 Sequence 2's) */
+        const int i = (int)(v + 0.5f);
+        ai_post(AI_HAND, 0, i < 0 ? 0 : i > 3 ? 3 : i);
+    } else if (id >= AP_N && id < AP_N + AI_NAUTO) {   /* (the host's value: the knob, and nothing said back) */
         ai_from_host = 1;
         ai_kset(AI_AUTO[id - AP_N].k, (int)(v + (v < 0.0f ? -0.5f : 0.5f)));
         ai_from_host = 0;
@@ -1050,6 +1091,16 @@ void vibe_on_event(const vibe_event *e)
     case VIBE_EV_ENCODER: ai_enc(e->id, e->value); break;
     case VIBE_EV_MIDI: ai_midi(e->midi); break;
     case VIBE_EV_PARAM: ai_param(e->id, e->value); break;
+    case VIBE_EV_TRANSPORT:                      /* (1.3) a host that gives its tempo as an event and no position: its
+                                                  * tempo, in the Tempo's range (0: the piece's own again). With a
+                                                  * position (vibe_transport) that leads, as before. Its PLAY is left
+                                                  * alone: such a host's MIDI clock starts and stops the piece */
+        if (e->id == VIBE_TRANSPORT_TEMPO) {
+            const en_param_t *in = en_param_info(P_TEMPO);
+            int b = (int)(e->value + 0.5f);
+            ai_post(AI_ETEMPO, 0, e->value > 0.0f ? b < in->lo ? in->lo : b > in->hi ? in->hi : b : 0);
+        }
+        break;
     case VIBE_EV_SAVE:                           /* the host keeps the state now */
         ai_sdirty = 1;
         ai_store();
